@@ -3,6 +3,12 @@
 # Runtime files are private, local, sanitized projections, never kubeconfig copies.
 # Developer publishing is isolated; the only cluster write exception is an
 # explicitly guarded post-push Flux reconciliation in developer release mode.
+# Changelog (compact):
+#   1.1.0 One-command triage (--triage, --triage-workload), capability report
+#         (--capabilities), Sentinel doctor (--doctor), --json machine-readable
+#         output, --quiet, exit code 4 for unavailable required data, next-check
+#         guidance, triage/capability/doctor fixture self-tests.
+#   1.0.0 Initial single-file read-only operations console.
 set -o pipefail
 set +x
 export -n SPLUNK_TOKEN 2>/dev/null || :
@@ -10,7 +16,7 @@ umask 077
 
 # 01 Constants and session state
 APP_NAME="KubeOps Sentinel"
-APP_VERSION="1.0.1"
+APP_VERSION="1.1.0"
 APP_BUILD="production"
 SOURCE_FILE="${BASH_SOURCE[0]}"
 SENTINEL_CONTEXT="${SNTL_CONTEXT:-}"
@@ -24,6 +30,7 @@ KUBECTL_VERSION=UNKNOWN SERVER_VERSION=UNKNOWN API_FINGERPRINT=UNAVAILABLE
 KUBECONFIG_MODE='KUBECTL DEFAULT'
 [[ ${KUBECONFIG+x} ]] && KUBECONFIG_MODE=EXPLICIT
 MODE=dashboard FORCE_REFRESH=0 NO_COLOR_FLAG=0 INTERACTIVE=0 SCOPE_READY=0
+JSON_FLAG=0 QUIET_FLAG=0 TRIAGE_WORKLOAD= DOCTOR_BOOTSTRAP_RC=0
 API_TIMEOUT=10 LOG_TIMEOUT=20 TLS_TIMEOUT=8 SPLUNK_TIMEOUT=20
 CPU_WARN=80 CPU_CRIT=90 MEM_WARN=80 MEM_CRIT=90 CERT_WARN_DAYS=90 CERT_CRIT_DAYS=30
 UI_COLS=120 UI_ROWS=30 UI_ACTIVE=0 UI_LAST_LINES=0 UI_STTY=
@@ -1246,6 +1253,314 @@ summary_report() {
     if [[ -s $RUN_DIR/findings.tsv ]]; then printf 'RECENT FINDINGS (from last health audit; refresh Health for complete checks)\n'; awk 'NR<=5' "$RUN_DIR/findings.tsv"; fi
 }
 
+# 18 One-command triage, capability discovery and Sentinel doctor. These are
+# orchestration layers over the shared collectors, findings engine and reports;
+# they add no new cluster calls and no duplicated parsing.
+next_check_hint() {
+    case $1 in
+        PODS|CONTAINERS|RESTARTS) printf 'Pod inspector + related events (dashboard 2) or --triage-workload NAME';;
+        SCHEDULING) printf 'Node & capacity view (dashboard 3); compare requests with allocatable';;
+        WORKLOADS|JOBS|CRONJOBS) printf 'Workload health (dashboard 4) and --triage-workload NAME';;
+        NETWORK) printf 'Network relationships (dashboard 5); selector vs ready endpoints';;
+        STORAGE) printf 'Storage view (dashboard 5 storage) and PVC/PV events';;
+        NODES|NODE_PRESSURE) printf 'Node capacity (dashboard 3) and node conditions';;
+        RESOURCE_PRESSURE) printf 'Live tracker sorted by cpu/memory (dashboard 1, key s)';;
+        GITOPS) printf 'GitOps drift (dashboard 12) and deployment validation chain';;
+        HELM) printf 'Helm status/history (dashboard 12)';;
+        CERTIFICATES|TLS) printf 'Certificate/TLS auditor (dashboard 9); expiry + handshake';;
+        EVENTS) printf 'Event timeline (dashboard 8) scoped to the affected object';;
+        CORRELATION) printf 'Incident evidence bundle (dashboard 7 / --evidence ID)';;
+        API|CAPABILITY|ANALYSIS) printf 'Diagnostics (dashboard 15); distinguish unavailable from failed';;
+        *) printf 'Full health audit (--health) and diagnostics (dashboard 15)';;
+    esac
+}
+
+triage_report() {
+    local health_rc=0 overall=0 pods_state failed=0 warnings=0 unknown=0 info=0 total=0
+    local severity category resource issue evidence
+    # The health audit already collects every category, runs the findings engine
+    # and deduplicates; triage renders the same evidence as a concise incident view.
+    health_report >/dev/null || health_rc=$?
+    pods_state=$(cache_status pods)
+    printf 'KUBERNETES TRIAGE | one-command incident scope\nCONTEXT\t%s\nNAMESPACE\t%s\nTIME\t%s\n' \
+        "$SENTINEL_CONTEXT" "$SENTINEL_NAMESPACE" "$(timestamp)"
+    printf 'AUTH\t%s\tAPI\t%s\tRBAC\t%s\tMETRICS\t%s\tGITOPS\t%s\tCERTIFICATES\t%s\n' \
+        "${AUTH_STATUS:-UNKNOWN}" "${API_STATUS:-UNKNOWN}" "${RBAC_STATUS:-UNKNOWN}" "${METRICS_STATUS:-UNKNOWN}" "${GITOPS_STATUS:-UNKNOWN}" "${CERT_STATUS:-UNKNOWN}"
+    printf 'COVERAGE\tpods=%s\tworkloads=%s\tevents=%s\tservices=%s\tstorage=%s\tgitops=%s\tcertificates=%s\n' \
+        "$pods_state" "$(cache_status workloads)" "$(cache_status events)" "$(cache_status services)" "$(cache_status pvcs)" "$(cache_status flux_kustomizations)" "$(cache_status cert_certificates)"
+    if ((health_rc==3)); then overall=3
+    elif [[ $pods_state != OK && $pods_state != EMPTY_RESULT ]]; then overall=4
+    fi
+    if [[ -s $RUN_DIR/findings.tsv ]] && has awk; then
+        failed=$(awk -F '\t' '$1=="FAIL"||$1=="CRITICAL"{n++} END{print n+0}' "$RUN_DIR/findings.tsv")
+        warnings=$(awk -F '\t' '$1=="WARN"{n++} END{print n+0}' "$RUN_DIR/findings.tsv")
+        unknown=$(awk -F '\t' '$1=="UNKNOWN"{n++} END{print n+0}' "$RUN_DIR/findings.tsv")
+        info=$(awk -F '\t' '$1=="INFO"{n++} END{print n+0}' "$RUN_DIR/findings.tsv")
+        total=$((failed+warnings))
+        printf 'FINDINGS\tFAIL=%s\tWARN=%s\tUNKNOWN=%s\tINFO=%s (full detail: --health)\n' "$failed" "$warnings" "$unknown" "$info"
+        printf 'SEVERITY\tCATEGORY\tRESOURCE\tISSUE\tEVIDENCE\tNEXT CHECK\n'
+        { awk -F '\t' '$1=="FAIL"||$1=="CRITICAL"{print}' "$RUN_DIR/findings.tsv"
+          awk -F '\t' '$1=="WARN"{print}' "$RUN_DIR/findings.tsv"; } | head -30 \
+        | while IFS=$'\t' read -r severity category resource issue evidence; do
+            printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$severity" "$category" "$resource" "$issue" "${evidence:-OBSERVED API status}" "$(next_check_hint "$category")"
+        done
+        ((total>30)) && printf 'TRUNCATED\t%s more FAIL/WARN findings; complete list in --health or dashboard 6\n' "$((total-30))"
+        ((unknown>0)) && printf 'UNKNOWN\t%s findings are data gaps, not healthy states; inspect --health coverage table\n' "$unknown"
+    else
+        printf 'FINDINGS\tUNAVAILABLE (findings engine requires awk; jq gaps are listed by --health)\n'
+    fi
+    if ((QUIET_FLAG==0)); then
+        if ! has jq; then
+            printf 'TOP PRESSURE\tUNAVAILABLE (jq required for usage ranking)\n'
+        elif [[ $pods_state != OK && $pods_state != EMPTY_RESULT ]]; then
+            printf 'TOP PRESSURE\tUNAVAILABLE (pod inventory %s; never reported as zero)\n' "$pods_state"
+        elif [[ ${METRICS_STATUS:-UNKNOWN} != OK && ${METRICS_STATUS:-UNKNOWN} != EMPTY_RESULT ]]; then
+            printf 'TOP PRESSURE\tUNAVAILABLE (metrics %s; never reported as zero)\n' "${METRICS_STATUS:-UNKNOWN}"
+        else
+            printf 'TOP PRESSURE (active pods; usage vs request is not node pressure)\n'
+            resource_rows_json | jq -r "$JQ_QUANTITIES"'
+              map(select(.active and (.cpu|type)=="number"))|sort_by(-.cpu)|.[:3][]|[.pod,"CPU "+(.cpu|cpu_fmt),"vs request "+pct(.cpu;.cpu_request),.node]|@tsv' || :
+            resource_rows_json | jq -r "$JQ_QUANTITIES"'
+              map(select(.active and (.memory|type)=="number"))|sort_by(-.memory)|.[:3][]|[.pod,"MEM "+(.memory|mem_fmt),"vs request "+pct(.memory;.memory_request),.node]|@tsv' || :
+        fi
+    fi
+    if ((QUIET_FLAG==0)) && has awk && [[ -s $RUN_DIR/findings.tsv ]]; then
+        printf 'SUGGESTED NEXT CHECKS (derived from observed findings; not a diagnosis)\n'
+        awk -F '\t' '$1=="FAIL"||$1=="CRITICAL"||$1=="WARN"{print $2}' "$RUN_DIR/findings.tsv" | awk '!seen[$0]++' \
+        | while IFS= read -r category; do
+            printf '%s\t%s\n' "$category" "$(next_check_hint "$category")"
+        done
+    fi
+    printf 'NEXT\tfull audit --health | per-workload --triage-workload NAME | evidence bundle --evidence ID\n'
+    printf 'TRIAGE EXIT\t0=no FAIL 1=observed FAIL 3=auth/API failure 4=required pod inventory unavailable\n'
+    ((failed>0 && overall==0)) && overall=1
+    return "$overall"
+}
+
+triage_workload_report() {
+    local query=${1:-} kind='' name='' overall=0 health_rc=0
+    local workloads_state pods_state full pod_rows pods_json='[]' wl_failed=0
+    local severity category resource issue evidence mre part
+    local -a matches=() pod_names=()
+    [[ -n $query ]] || { printf 'WORKLOAD TRIAGE\tUNAVAILABLE: no workload specified\n'; return 2; }
+    if [[ $query == */* ]]; then
+        kind=${query%%/*} name=${query##*/}
+        [[ $kind =~ ^[A-Za-z][A-Za-z0-9.-]*$ ]] || { printf 'WORKLOAD TRIAGE\tinvalid kind in query\n'; return 2; }
+    else name=$query; fi
+    # The health audit primes the shared caches and the findings engine once.
+    health_report >/dev/null || health_rc=$?
+    workloads_state=$(cache_status workloads); pods_state=$(cache_status pods)
+    printf 'WORKLOAD TRIAGE | %s\nCONTEXT\t%s\nNAMESPACE\t%s\nTIME\t%s\n' "$query" "$SENTINEL_CONTEXT" "$SENTINEL_NAMESPACE" "$(timestamp)"
+    if [[ $workloads_state != OK && $workloads_state != EMPTY_RESULT ]]; then
+        printf 'WORKLOAD INVENTORY\t%s\tworkload correlation NOT VERIFIED\n' "$workloads_state"
+        return 4
+    fi
+    if [[ $pods_state != OK && $pods_state != EMPTY_RESULT ]]; then
+        printf 'POD INVENTORY\t%s\tpod correlation NOT VERIFIED\n' "$pods_state"
+        overall=4
+    fi
+    if ! has jq; then
+        printf 'ANALYSIS\tCOMMAND_MISSING jq\tworkload correlation requires jq; inventory-only conclusion\n'
+        [[ $overall == 0 ]] && overall=4
+        return "$overall"
+    fi
+    if [[ -n $kind ]]; then
+        mapfile -t matches < <(jq -r --arg k "$kind" --arg n "$name" '.items[]?|select(.kind==$k and .metadata.name==$n)|.kind+"/"+.metadata.name' "$(json_cache_path workloads)")
+    else
+        mapfile -t matches < <(jq -r --arg n "$name" '.items[]?|select(.metadata.name==$n)|.kind+"/"+.metadata.name' "$(json_cache_path workloads)")
+    fi
+    ((${#matches[@]})) || {
+        printf 'WORKLOAD\tNOT FOUND\t%s\nNo fuzzy guessing: list candidates with --resources or dashboard 4.\n' "$query"
+        return 2
+    }
+    ((${#matches[@]}==1)) || printf 'NOTE\t%s objects match this name; every match is shown\n' "${#matches[@]}"
+    for full in "${matches[@]}"; do
+        kind=${full%%/*} name=${full##*/}
+        printf '\nWORKLOAD\t%s\n' "$full"
+        jq -r --arg k "$kind" --arg n "$name" '
+          .items[]?|select(.kind==$k and .metadata.name==$n)|. as $w|
+          (["DESIRED",(if $w.kind=="DaemonSet" then ($w.status.desiredNumberScheduled // "UNKNOWN_DESIRED") else ($w.spec.replicas // 1) end|tostring),
+            "READY",(if $w.kind=="DaemonSet" then ($w.status.numberReady // 0) else ($w.status.readyReplicas // 0) end|tostring),
+            "AVAILABLE",($w.status.availableReplicas // 0|tostring)]|@tsv),
+          (["GENERATION",($w.metadata.generation // 0|tostring),"OBSERVED",($w.status.observedGeneration // 0|tostring),
+            "SUSPENDED",($w.spec.suspend // false|tostring)]|@tsv),
+          ($w.spec.template.spec.containers[]?|["IMAGE",.image]|@tsv)' "$(json_cache_path workloads)"
+        printf 'PODS (owner resolved through ReplicaSet where applicable)\nPOD\tPHASE\tREADY\tRESTARTS\tAGE\tNODE\tCPU\tMEMORY\n'
+        pod_rows=$(resource_rows_json | jq -r --arg full "$full" "$JQ_QUANTITIES"'
+          map(select(.owner==$full))|sort_by(.pod)[]|[.pod,.phase,.ready,(.restarts|tostring),.age,.node,(.cpu|cpu_fmt),(.memory|mem_fmt)]|@tsv' 2>/dev/null) || :
+        if [[ -n $pod_rows ]]; then
+            printf '%s\n' "$pod_rows"
+            mapfile -t pod_names < <(printf '%s\n' "$pod_rows" | awk -F '\t' 'NF>0{print $1}')
+        else
+            printf 'NONE\tcontroller has not created observed pods for this owner; inventory-only conclusion\n'
+            pod_names=()
+        fi
+        if ((${#pod_names[@]})); then
+            pods_json=$(printf '%s\n' "${pod_names[@]}" | jq -R . | jq -s .)
+        else pods_json='[]'; fi
+        printf 'RELATED WARNING EVENTS (events cache: %s; retained window only)\nTIMESTAMP\tREASON\tOBJECT\tMESSAGE\tCOUNT\n' "$(cache_status events)"
+        jq -r --arg k "$kind" --arg n "$name" --argjson pods "$pods_json" '
+          .items[]?|select(.type=="Warning" and ((.involvedObject.kind==$k and .involvedObject.name==$n) or (.involvedObject.kind=="Pod" and (.involvedObject.name as $on | ($pods|index($on))))))|
+          [(.eventTime // .lastTimestamp // .metadata.creationTimestamp // "UNKNOWN"),(.reason // "Warning"),((.involvedObject.kind // "Object")+"/"+(.involvedObject.name // "UNKNOWN")),.message // "",(.series.count // .count // 1|tostring)]|@tsv' "$(json_cache_path events)"
+        printf 'SERVICE RELATIONSHIPS (services cache: %s)\nSERVICE\tREADY ENDPOINTS\tSTATUS\tSOURCE\n' "$(cache_status services)"
+        network_rows_json | jq -r --argjson pods "$pods_json" '
+          .[]|select(.pods and ([.pods[]|. as $p|select($pods|index($p))]|length)>0)|[.name,(.ready_endpoints|tostring),.status,.endpoint_source]|@tsv' 2>/dev/null || :
+        printf 'STORAGE (PVCs referenced by these pods; pvcs cache: %s)\nPVC\tPV\tPHASE\tCAPACITY\tCLASS\n' "$(cache_status pvcs)"
+        jq -r --argjson pods "$pods_json" --slurpfile vx "$(json_cache_path pvcs)" '
+          [.items[]?|. as $pod|select($pods|index($pod.metadata.name))|.spec.volumes[]?|select(.persistentVolumeClaim)|.persistentVolumeClaim.claimName]|unique|.[] as $c|
+          ($vx[0].items[]?|select(.metadata.name==$c)) as $pvc|
+          [$c,($pvc.spec.volumeName // "-"),($pvc.status.phase // "UNKNOWN"),($pvc.status.capacity.storage // "UNKNOWN"),($pvc.spec.storageClassName // "-")]|@tsv' "$(json_cache_path pods)" 2>/dev/null || :
+        printf 'GITOPS CORRELATION (exact name match only; Flux cache: %s)\nOBJECT\tREADY\tREASON\tREVISION\n' "$(cache_status flux_kustomizations)"
+        for key in flux_kustomizations flux_helmreleases; do
+            jq -r --arg n "$name" '
+              .items[]?|select(.metadata.name==$n)|. as $o|
+              ([.status.conditions[]?|select(.type=="Ready")][0] // {}) as $r|
+              [($o.kind // "Object")+"/"+$o.metadata.name,($r.status // "UNKNOWN"),($r.reason // "-"),($o.status.artifact.revision // $o.status.lastAppliedRevision // "-")]|@tsv' "$(json_cache_path "$key")" 2>/dev/null || :
+        done
+        if [[ -s $CACHE_DIR/helm.txt ]]; then
+            jq -r --arg n "$name" '.[]?|select(.name==$n)|["HELM/"+.name,(.status // "UNKNOWN"),(.chart // "-")]|@tsv' "$CACHE_DIR/helm.txt" 2>/dev/null || :
+        fi
+        printf 'FINDINGS FOR THIS WORKLOAD (from the shared findings engine)\nSEVERITY\tCATEGORY\tRESOURCE\tISSUE\tEVIDENCE\tNEXT CHECK\n'
+        if [[ -s $RUN_DIR/findings.tsv ]] && has awk; then
+            mre=${matches[0]}
+            for part in "${matches[@]:1}" "${pod_names[@]}"; do mre+="|$part"; done
+            awk -F '\t' -v re="^($mre)$" '$3 ~ re {print}' "$RUN_DIR/findings.tsv" \
+            | while IFS=$'\t' read -r severity category resource issue evidence; do
+                printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$severity" "$category" "$resource" "$issue" "${evidence:-OBSERVED API status}" "$(next_check_hint "$category")"
+            done
+            wl_failed=$(awk -F '\t' -v re="^($mre)$" '($3 ~ re) && ($1=="FAIL"||$1=="CRITICAL"){n++} END{print n+0}' "$RUN_DIR/findings.tsv")
+        else
+            printf 'FINDINGS\tUNAVAILABLE (findings engine requires awk)\n'
+        fi
+        printf 'NEXT\tinspect pods: dashboard 2 | logs: dashboard 13 | evidence bundle: --evidence ID\n'
+        ((wl_failed>0 && overall==0)) && overall=1
+    done
+    if ((health_rc==3)); then overall=3; fi
+    printf 'WORKLOAD TRIAGE EXIT\t0=no FAIL 1=observed FAIL 3=auth/API failure 4=inventory unavailable\n'
+    return "$overall"
+}
+
+capabilities_report() {
+    local cmd
+    printf 'CAPABILITY REPORT | dynamically determined; menus adapt automatically\nCONTEXT\t%s\nNAMESPACE\t%s\nTIME\t%s\n' \
+        "$SENTINEL_CONTEXT" "$SENTINEL_NAMESPACE" "$(timestamp)"
+    printf '\nLOCAL TOOLS\n'
+    for cmd in kubectl helm flux jq openssl curl timeout sha256sum column tput base64 awk sed grep sort uniq date git shellcheck inotifywait flock less; do
+        printf '%-14s %s\n' "$cmd" "${DEPENDENCIES[$cmd]:-UNKNOWN}"
+    done
+    printf '\nCLUSTER ACCESS\n'
+    printf 'Authentication\t%s\nAPI\t%s\nAPI latency\t%s\nRBAC\t%s\n' \
+        "${AUTH_STATUS:-UNKNOWN}" "${API_STATUS:-UNKNOWN}" "${API_LATENCY:-UNKNOWN}" "${RBAC_STATUS:-UNKNOWN}"
+    printf 'kubectl client\t%s\nKubernetes server\t%s\n' "$KUBECTL_VERSION" "$SERVER_VERSION"
+    printf '\nCLUSTER CAPABILITIES\n'
+    printf 'Core resources (pods)\t%s\n' "$(cache_status pods)"
+    printf 'Metrics API (usage)\t%s\n' "$METRICS_STATUS"
+    printf 'Flux GitOps APIs\t%s\n' "$GITOPS_STATUS"
+    if [[ $(cache_status helm) == NOT_COLLECTED && $SCOPE_READY == 1 ]] && declare -F helm_report >/dev/null; then
+        helm_report >/dev/null || :
+    fi
+    printf 'Helm releases\t%s\n' "$(cache_status helm)"
+    printf 'cert-manager\t%s\n' "$CERT_STATUS"
+    if [[ -n ${SPLUNK_URL:-} && -n ${SPLUNK_TOKEN:-} ]]; then
+        printf 'Splunk\tCONFIGURED\tindex=%s sourcetype=%s (token never displayed)\n' "${SPLUNK_INDEX:-default}" "${SPLUNK_SOURCETYPE:-default}"
+    else printf 'Splunk\tNOT_CONFIGURED\tset SPLUNK_URL and SPLUNK_TOKEN for live discovery\n'; fi
+    printf '\nRBAC READ MATRIX\n'
+    if [[ -s $CACHE_DIR/rbac.txt ]]; then cat -- "$CACHE_DIR/rbac.txt"
+    else printf 'NOT_PROBED (scope unavailable; see --doctor)\n'; fi
+    printf '\nINTERPRETATION\n'
+    printf 'NOT INSTALLED / NOT_CONFIGURED / NOT_PROBED are access or installation states, not failures.\n'
+    printf 'Unavailable features stay visible in menus with explicit status instead of being hidden.\n'
+    printf 'Splunk catalog generation works offline; discovery and validation require configuration.\n'
+    return 0
+}
+
+doctor_report() {
+    local failed=0 rc raw contexts=0 cmd core_missing=0 rc_ok=0 rc_bad=0 rc_res=0
+    printf 'SENTINEL DOCTOR | diagnoses whether this tool can operate here\nTIME\t%s\nHOST\t%s\nSHELL\t%s\n' \
+        "$(timestamp)" "${HOSTNAME:-UNKNOWN}" "$BASH_VERSION"
+    printf '\nSHELL AND CORE\n'
+    if ((BASH_VERSINFO[0]>4 || (BASH_VERSINFO[0]==4 && BASH_VERSINFO[1]>=4))); then
+        printf 'Bash >= 4.4\tOK\t%s\n' "$BASH_VERSION"
+    else printf 'Bash >= 4.4\tFAIL\t%s\n' "$BASH_VERSION"; failed=1; fi
+    for cmd in mktemp mkdir rm cat awk sed grep sort uniq date; do
+        has "$cmd" || { printf 'Core utility %s\tFAIL\tmissing\n' "$cmd"; core_missing=1; }
+    done
+    ((core_missing)) && failed=1
+    ((core_missing)) || printf 'Core utilities\tOK\tmktemp mkdir rm cat awk sed grep sort uniq date present\n'
+    printf '\nOPTIONAL TOOLS (impact when missing)\n'
+    if [[ ${DEPENDENCIES[jq]:-UNKNOWN} == AVAILABLE ]]; then printf 'jq\tOK\tJSON analysis, structured reports, --json output\n'
+    else printf 'jq\tWARN\tstructured analysis and --json output unavailable\n'; fi
+    if [[ ${DEPENDENCIES[openssl]:-UNKNOWN} == AVAILABLE ]]; then printf 'openssl\tOK\tcertificate and TLS auditing\n'
+    else printf 'openssl\tWARN\tcertificate/TLS auditing unavailable\n'; fi
+    if [[ ${DEPENDENCIES[curl]:-UNKNOWN} == AVAILABLE ]]; then printf 'curl\tOK\tSplunk live discovery/validation\n'
+    else printf 'curl\tWARN\tSplunk live queries unavailable; offline catalog remains\n'; fi
+    if [[ ${DEPENDENCIES[timeout]:-UNKNOWN} == AVAILABLE ]]; then printf 'timeout\tOK\tcommand deadline enforcement\n'
+    else printf 'timeout\tWARN\tfallback watchdog deadlines; upgrade recommended\n'; fi
+    if [[ ${DEPENDENCIES[sha256sum]:-UNKNOWN} == AVAILABLE ]]; then printf 'sha256sum\tOK\tevidence integrity manifests\n'
+    else printf 'sha256sum\tWARN\tevidence integrity manifests unavailable\n'; fi
+    if [[ ${DEPENDENCIES[git]:-UNKNOWN} == AVAILABLE ]]; then printf 'git\tOK\tdeveloper publishing workflow\n'
+    else printf 'git\tWARN\tdeveloper publishing unavailable\n'; fi
+    printf '\nKUBERNETES CLIENT AND CONFIGURATION\n'
+    if [[ ${DEPENDENCIES[kubectl]:-UNKNOWN} == AVAILABLE ]]; then
+        printf 'kubectl\tOK\t%s\n' "$(command -v kubectl)"
+        raw=$(config_query get-contexts -o name 2>/dev/null); rc=$?
+        if ((rc==0)); then
+            contexts=$(grep -c . <<< "$raw" 2>/dev/null) || contexts=0
+            if ((contexts>0)); then printf 'Kubeconfig contexts\tOK\t%s discovered\n' "$contexts"
+            else printf 'Kubeconfig contexts\tNOT_CONFIGURED\tno contexts; kubectl config needed for cluster modes\n'; failed=1; fi
+        else
+            printf 'Kubeconfig contexts\t%s\tkubectl config get-contexts failed\n' "$(classify_error "$rc" "$raw")"
+            failed=1
+        fi
+    else
+        printf 'kubectl\tFAIL\tnot installed; every cluster feature is unavailable\n'
+        failed=1
+    fi
+    printf 'KUBECONFIG MODE\t%s (never modified by this tool)\n' "$KUBECONFIG_MODE"
+    printf '\nCLUSTER SCOPE\n'
+    if [[ $SCOPE_READY == 1 ]]; then
+        printf 'Scope bootstrap\tOK\tcontext=%s namespace=%s\n' "$SENTINEL_CONTEXT" "$SENTINEL_NAMESPACE"
+        printf 'Authentication\t%s\nAPI\t%s\nRBAC\t%s\nMetrics\t%s\nGitOps\t%s\ncert-manager\t%s\n' \
+            "$AUTH_STATUS" "$API_STATUS" "$RBAC_STATUS" "$METRICS_STATUS" "$GITOPS_STATUS" "$CERT_STATUS"
+    else
+        case $DOCTOR_BOOTSTRAP_RC in
+            2) printf 'Scope bootstrap\tFAIL\tconfiguration exit 2: context/namespace/kubeconfig\n'; failed=1;;
+            3) printf 'Scope bootstrap\tFAIL\tauthentication or API failure (exit 3)\n';;
+            *) printf 'Scope bootstrap\tUNKNOWN\texit %s; cluster-dependent checks NOT VERIFIED\n' "$DOCTOR_BOOTSTRAP_RC";;
+        esac
+    fi
+    printf '\nRUNTIME AND TERMINAL\n'
+    if [[ -n $RUN_DIR && -d $RUN_DIR && -w $RUN_DIR ]]; then printf 'Private runtime\tOK\t%s\n' "$RUN_DIR"
+    else printf 'Private runtime\tFAIL\tmissing or not writable\n'; failed=1; fi
+    if ((INTERACTIVE)); then printf 'Terminal\tOK\t%dx%d interactive\n' "$UI_COLS" "$UI_ROWS"
+    else printf 'Terminal\tNONINTERACTIVE\tno controlling tty; dashboards require one\n'; fi
+    if [[ -n ${SPLUNK_URL:-} && -n ${SPLUNK_TOKEN:-} ]]; then printf 'Splunk configuration\tOK\tURL configured (token never displayed)\n'
+    else printf 'Splunk configuration\tNOT_CONFIGURED\toptional; offline catalog remains available\n'; fi
+    printf '\nREAD-ONLY DISCIPLINE (live self-check of the pure scope guards)\n'
+    scope_args_safe get pods -o json >/dev/null 2>&1 || rc_ok=1
+    scope_args_safe --token=fixture >/dev/null 2>&1; rc=$?
+    [[ $rc == 2 ]] || rc_bad=1
+    scope_args_safe --server=https://fixture.invalid >/dev/null 2>&1; rc=$?
+    [[ $rc == 2 ]] || rc_bad=1
+    allowed_resource ns pods >/dev/null 2>&1 || rc_res=1
+    allowed_resource ns arbitrary-fixture >/dev/null 2>&1; rc=$?
+    [[ $rc == 2 ]] || rc_res=1
+    if ((rc_ok==0 && rc_bad==0 && rc_res==0)); then
+        printf 'Scope guards\tOK\tnormal reads allowed; token/server/all-namespaces escape rejected\n'
+    else printf 'Scope guards\tFAIL\tguard self-check rejected an expected state\n'; failed=1; fi
+    printf '\nPLATFORM\n'
+    if dev_is_wsl 2>/dev/null; then printf 'WSL\tDETECTED\tdeveloper workflow usable\n'
+    elif [[ $(uname -s 2>/dev/null) == Linux ]]; then printf 'Platform\tLinux native\n'
+    else printf 'Platform\t%s\tbash-compatible shell required\n' "$(uname -s 2>/dev/null || printf UNKNOWN)"; fi
+    printf '\nDOCTOR SUMMARY\n'
+    case ${AUTH_STATUS:-UNKNOWN}:${API_STATUS:-UNKNOWN}:${DOCTOR_BOOTSTRAP_RC} in
+        *AUTH_ERROR*|*AUTH_REQUIRED*|*:3) printf 'Result\tFAIL\tauthentication/API failure; fix access before operational use\n'; return 3;;
+    esac
+    if ((failed)); then printf 'Result\tFAIL\tat least one required capability is broken; details above\n'; return 1; fi
+    printf 'Result\tOK\tSentinel can operate; optional gaps are explicitly classified above\n'
+    return 0
+}
+
 resource_self_tests() {
     has jq || { printf 'SKIP resource arithmetic: jq unavailable\n'; return 0; }
     local result
@@ -1381,6 +1696,147 @@ JSON
     resource_rows_json | jq -e 'length==0' >/dev/null || ((errors+=1))
     if ((errors)); then printf 'FAIL resource fixtures: %s failures\n' "$errors"; exit 1; fi
     printf 'PASS all resource report, redaction projection, health, denied, empty, and 501-pod fixtures\n'
+)
+
+# Offline triage/capability/doctor fixtures exercise the new orchestration layers
+# over the same stubbed-collector pattern used by the resource fixtures.
+triage_integration_tests() (
+    has jq || { printf 'SKIP triage fixtures: jq unavailable\n'; exit 0; }
+    local test_root rc errors=0
+    test_root=$(mktemp -d "$RUN_DIR/triage-fixtures.XXXXXX") || exit 1
+    trap 'rm -rf -- "$test_root"' EXIT
+    RUN_DIR=$test_root CACHE_DIR=$test_root/cache
+    mkdir -p -- "$CACHE_DIR" || exit 1
+    SENTINEL_NAMESPACE=fixture-ns SENTINEL_CONTEXT=fixture-context
+    AUTH_STATUS=AUTHENTICATED API_STATUS=OK API_LATENCY=fixture RBAC_STATUS=OK
+    METRICS_STATUS=OK GITOPS_STATUS=NOT_INSTALLED CERT_STATUS=TLS_SECRETS
+    KUBECTL_VERSION=fixture SERVER_VERSION=fixture SCOPE_READY=1 FORCE_REFRESH=0
+    QUIET_FLAG=0 JSON_FLAG=0 DOCTOR_BOOTSTRAP_RC=0
+    DEPENDENCIES[kubectl]=AVAILABLE DEPENDENCIES[jq]=AVAILABLE DEPENDENCIES[openssl]=AVAILABLE
+    DEPENDENCIES[awk]=AVAILABLE DEPENDENCIES[timeout]=AVAILABLE DEPENDENCIES[sha256sum]=AVAILABLE
+    DEPENDENCIES[git]=AVAILABLE DEPENDENCIES[curl]='NOT INSTALLED' DEPENDENCIES[helm]='NOT INSTALLED'
+    cache_status() { if [[ -f $CACHE_DIR/$1.status ]]; then cat -- "$CACHE_DIR/$1.status"; else printf 'NOT_COLLECTED\n'; fi; }
+    cache_age() { printf '0\n'; }
+    collect_json() {
+        local key=$1 projection=$5 fixture="$RUN_DIR/$1.fixture.json"
+        printf '%s\n' "$key" >> "$RUN_DIR/calls"
+        if [[ ${FIXTURE_DENIED:-} == "$key" ]]; then
+            rm -f -- "$CACHE_DIR/$key.json"
+            printf 'RBAC_DENIED\n' > "$CACHE_DIR/$key.status"; return 1
+        fi
+        [[ -s $fixture ]] || printf '{"items":[]}\n' > "$fixture"
+        if jq "$projection" "$fixture" > "$CACHE_DIR/$key.json"; then
+            printf 'OK\n' > "$CACHE_DIR/$key.status"
+        else printf 'PARSE_ERROR\n' > "$CACHE_DIR/$key.status"; return 1; fi
+    }
+    config_query() { printf 'fixture-context\nother-context\n'; }
+    gitops_report() { :; }; helm_report() { :; }; certificates_report() { :; }
+    gitops_findings() { :; }; certificates_findings() { :; }
+    cat > "$RUN_DIR/pods.fixture.json" <<'JSON'
+{"items":[{"kind":"Pod","metadata":{"name":"fixture-pod","uid":"fixture-uid","namespace":"fixture-ns","creationTimestamp":"2026-01-01T00:00:00Z","labels":{"app":"fixture"},"ownerReferences":[{"kind":"ReplicaSet","name":"fixture-rs","controller":true}]},"spec":{"nodeName":"fixture-node","containers":[{"name":"app","image":"fixture/app:latest","env":[{"name":"CONFIG","value":"OMIT_LITERAL_VALUE"},{"name":"FROM_SECRET","valueFrom":{"secretKeyRef":{"name":"settings","key":"keyname"}}}],"command":["OMIT_COMMAND"],"resources":{"requests":{"cpu":"1","memory":"512Mi"},"limits":{"cpu":"2","memory":"1Gi"}},"volumeMounts":[{"name":"config","mountPath":"/etc/config"}]}],"initContainers":[{"name":"sidecar","restartPolicy":"Always","image":"fixture/sidecar:v1","resources":{"requests":{"cpu":"200m","memory":"10Mi"},"limits":{"cpu":"500m","memory":"100Mi"}}}],"volumes":[{"name":"config","secret":{"secretName":"settings"}}],"overhead":{"cpu":"50m","memory":"5Mi"}},"status":{"phase":"Running","qosClass":"Burstable","podIP":"192.0.2.1","conditions":[{"type":"Ready","status":"False"}],"containerStatuses":[{"name":"app","ready":false,"restartCount":8,"state":{"waiting":{"reason":"CrashLoopBackOff","message":"fixture failure"}},"lastState":{"terminated":{"reason":"OOMKilled","exitCode":137,"finishedAt":"2026-01-01T01:00:00Z"}}}],"initContainerStatuses":[{"name":"sidecar","ready":true,"restartCount":0,"state":{"running":{"startedAt":"2026-01-01T00:00:01Z"}}}]}}]}
+JSON
+    cat > "$RUN_DIR/workloads.fixture.json" <<'JSON'
+{"items":[{"kind":"Deployment","metadata":{"name":"fixture","generation":2},"spec":{"replicas":2},"status":{"readyReplicas":0,"availableReplicas":0,"observedGeneration":1}},{"kind":"ReplicaSet","metadata":{"name":"fixture-rs","ownerReferences":[{"kind":"Deployment","name":"fixture","controller":true}]},"spec":{"replicas":2},"status":{"readyReplicas":0}}]}
+JSON
+    cat > "$RUN_DIR/metrics.fixture.json" <<'JSON'
+{"items":[{"metadata":{"name":"fixture-pod"},"timestamp":"2026-01-01T02:00:00Z","window":"30s","containers":[{"name":"app","usage":{"cpu":"312000000n","memory":"600Mi"}},{"name":"sidecar","usage":{"cpu":"50000000n","memory":"20Mi"}}]}]}
+JSON
+    cat > "$RUN_DIR/services.fixture.json" <<'JSON'
+{"items":[{"metadata":{"name":"fixture"},"spec":{"selector":{"app":"fixture"},"type":"ClusterIP","clusterIP":"192.0.2.10","ports":[{"port":80,"targetPort":8080}]}},{"metadata":{"name":"headless"},"spec":{"selector":{"app":"fixture"},"clusterIP":"None","ports":[{"port":80}]}},{"metadata":{"name":"external"},"spec":{"type":"ExternalName","externalName":"example.invalid"}}]}
+JSON
+    cat > "$RUN_DIR/endpointslices.fixture.json" <<'JSON'
+{"items":[{"metadata":{"name":"fixture-1","labels":{"kubernetes.io/service-name":"fixture"}},"ports":[{"port":8080}],"endpoints":[{"addresses":["192.0.2.1"],"conditions":{"ready":true},"targetRef":{"kind":"Pod","name":"fixture-pod"}}]}]}
+JSON
+    printf '{"items":[{"metadata":{"name":"headless"}}]}\n' > "$RUN_DIR/endpoints.fixture.json"
+    cat > "$RUN_DIR/events.fixture.json" <<'JSON'
+{"items":[{"metadata":{"name":"warning","namespace":"fixture-ns","creationTimestamp":"2026-01-01T00:00:00Z"},"lastTimestamp":"2026-01-01T02:00:00Z","type":"Warning","reason":"BackOff","involvedObject":{"kind":"Pod","name":"fixture-pod","namespace":"fixture-ns","uid":"fixture-uid"},"message":"Back-off restarting failed container","count":8}]}
+JSON
+    cat > "$RUN_DIR/nodes.fixture.json" <<'JSON'
+{"items":[{"metadata":{"name":"fixture-node","labels":{"topology.kubernetes.io/zone":"fixture-zone","nodepool":"workers"}},"status":{"capacity":{"cpu":"4","memory":"8Gi"},"allocatable":{"cpu":"3800m","memory":"7Gi"},"conditions":[{"type":"Ready","status":"True"}]}}]}
+JSON
+    printf '{"items":[{"metadata":{"name":"fixture-node"},"usage":{"cpu":"2","memory":"4Gi"}}]}\n' > "$RUN_DIR/nodemetrics.fixture.json"
+    printf 'pods\tlist\tOK\ndeployments\tlist\tOK\n' > "$CACHE_DIR/rbac.txt"
+    printf '[]\n' > "$CACHE_DIR/helm.txt"; printf 'OK\n' > "$CACHE_DIR/helm.status"
+    # Namespace triage: FAIL findings expected (CrashLoop, unready, 0/2 deployment).
+    triage_report > "$test_root/triage.out" 2> "$test_root/triage.err"; rc=$?
+    [[ $rc == 1 ]] || { printf 'FAIL triage exit expected 1 observed %s\n' "$rc"; ((errors+=1)); }
+    [[ -s $test_root/triage.err ]] && { printf 'FAIL triage stderr\n'; cat "$test_root/triage.err"; ((errors+=1)); }
+    grep -q 'KUBERNETES TRIAGE' "$test_root/triage.out" || { printf 'FAIL triage header\n'; ((errors+=1)); }
+    grep -q 'CrashLoopBackOff' "$test_root/triage.out" || { printf 'FAIL triage finding detail\n'; ((errors+=1)); }
+    grep -q 'NEXT CHECK' "$test_root/triage.out" || { printf 'FAIL triage next-check guidance\n'; ((errors+=1)); }
+    grep -q 'TOP PRESSURE' "$test_root/triage.out" || { printf 'FAIL triage top pressure\n'; ((errors+=1)); }
+    grep -q 'SUGGESTED NEXT CHECKS' "$test_root/triage.out" || { printf 'FAIL triage next-check section\n'; ((errors+=1)); }
+    grep -q $'fixture-pod\tCPU 362m' "$test_root/triage.out" || { printf 'FAIL triage top-pressure ranking row\n'; ((errors+=1)); }
+    # Required pod inventory unavailable -> exit 4, explicit state, never zero.
+    FIXTURE_DENIED=pods
+    triage_report > "$test_root/triage4.out" 2> /dev/null; rc=$?
+    [[ $rc == 4 ]] || { printf 'FAIL triage unavailable exit expected 4 observed %s\n' "$rc"; ((errors+=1)); }
+    grep -q $'COVERAGE\tpods=RBAC_DENIED' "$test_root/triage4.out" || { printf 'FAIL triage unavailable coverage state\n'; ((errors+=1)); }
+    FIXTURE_DENIED=
+    # Authentication failure -> exit 3.
+    AUTH_STATUS=AUTH_ERROR API_STATUS=AUTH_ERROR
+    triage_report > "$test_root/triage3.out" 2> /dev/null; rc=$?
+    [[ $rc == 3 ]] || { printf 'FAIL triage auth exit expected 3 observed %s\n' "$rc"; ((errors+=1)); }
+    AUTH_STATUS=AUTHENTICATED API_STATUS=OK
+    # Workload triage: correlation across pods, events, services, findings.
+    triage_workload_report fixture > "$test_root/wl.out" 2> "$test_root/wl.err"; rc=$?
+    [[ $rc == 1 ]] || { printf 'FAIL workload triage exit expected 1 observed %s\n' "$rc"; ((errors+=1)); }
+    [[ -s $test_root/wl.err ]] && { printf 'FAIL workload triage stderr\n'; cat "$test_root/wl.err"; ((errors+=1)); }
+    grep -q 'Deployment/fixture' "$test_root/wl.out" || { printf 'FAIL workload match\n'; ((errors+=1)); }
+    grep -q 'fixture-pod' "$test_root/wl.out" || { printf 'FAIL workload pod rows\n'; ((errors+=1)); }
+    grep -q 'BackOff' "$test_root/wl.out" || { printf 'FAIL workload related events\n'; ((errors+=1)); }
+    grep -A3 'SERVICE RELATIONSHIPS' "$test_root/wl.out" | grep -q 'fixture' || { printf 'FAIL workload service mapping\n'; ((errors+=1)); }
+    grep -q 'GITOPS CORRELATION' "$test_root/wl.out" || { printf 'FAIL workload gitops section\n'; ((errors+=1)); }
+    grep -q 'FINDINGS FOR THIS WORKLOAD' "$test_root/wl.out" || { printf 'FAIL workload findings section\n'; ((errors+=1)); }
+    triage_workload_report Deployment/fixture > "$test_root/wlk.out" 2>/dev/null; rc=$?
+    [[ $rc == 1 ]] || { printf 'FAIL workload kind query exit expected 1 observed %s\n' "$rc"; ((errors+=1)); }
+    grep -q 'Deployment/fixture' "$test_root/wlk.out" || { printf 'FAIL workload kind query match\n'; ((errors+=1)); }
+    triage_workload_report nonexistent > "$test_root/wln.out" 2>/dev/null; rc=$?
+    [[ $rc == 2 ]] || { printf 'FAIL workload not-found exit expected 2 observed %s\n' "$rc"; ((errors+=1)); }
+    grep -q 'NOT FOUND' "$test_root/wln.out" || { printf 'FAIL workload not-found notice\n'; ((errors+=1)); }
+    FIXTURE_DENIED=workloads
+    triage_workload_report fixture > "$test_root/wl4.out" 2>/dev/null; rc=$?
+    [[ $rc == 4 ]] || { printf 'FAIL workload triage unavailable exit expected 4 observed %s\n' "$rc"; ((errors+=1)); }
+    FIXTURE_DENIED=
+    # Capabilities: explicit states, never invented availability.
+    capabilities_report > "$test_root/cap.out" 2> "$test_root/cap.err"; rc=$?
+    [[ $rc == 0 ]] || { printf 'FAIL capabilities exit expected 0 observed %s\n' "$rc"; ((errors+=1)); }
+    [[ -s $test_root/cap.err ]] && { printf 'FAIL capabilities stderr\n'; cat "$test_root/cap.err"; ((errors+=1)); }
+    grep -q 'CAPABILITY REPORT' "$test_root/cap.out" || { printf 'FAIL capabilities header\n'; ((errors+=1)); }
+    grep -q 'Metrics API' "$test_root/cap.out" || { printf 'FAIL capabilities metrics line\n'; ((errors+=1)); }
+    grep -q 'NOT_INSTALLED' "$test_root/cap.out" || { printf 'FAIL capabilities flux state\n'; ((errors+=1)); }
+    grep -q 'NOT_CONFIGURED' "$test_root/cap.out" || { printf 'FAIL capabilities splunk state\n'; ((errors+=1)); }
+    grep -q $'pods\tlist\tOK' "$test_root/cap.out" || { printf 'FAIL capabilities rbac matrix\n'; ((errors+=1)); }
+    grep -q $'Helm releases\tOK' "$test_root/cap.out" || { printf 'FAIL capabilities helm cache state\n'; ((errors+=1)); }
+    # Doctor: healthy environment passes; missing kubectl is an explicit FAIL.
+    doctor_report > "$test_root/doc.out" 2> "$test_root/doc.err"; rc=$?
+    [[ $rc == 0 ]] || { printf 'FAIL doctor exit expected 0 observed %s\n' "$rc"; ((errors+=1)); }
+    [[ -s $test_root/doc.err ]] && { printf 'FAIL doctor stderr\n'; cat "$test_root/doc.err"; ((errors+=1)); }
+    grep -q 'SENTINEL DOCTOR' "$test_root/doc.out" || { printf 'FAIL doctor header\n'; ((errors+=1)); }
+    grep -q 'Core utilities' "$test_root/doc.out" || { printf 'FAIL doctor core section\n'; ((errors+=1)); }
+    grep -q 'Kubeconfig contexts' "$test_root/doc.out" || { printf 'FAIL doctor kubeconfig section\n'; ((errors+=1)); }
+    grep -q 'READ-ONLY DISCIPLINE' "$test_root/doc.out" || { printf 'FAIL doctor discipline section\n'; ((errors+=1)); }
+    grep -q 'Scope guards' "$test_root/doc.out" || { printf 'FAIL doctor scope guards\n'; ((errors+=1)); }
+    grep -q 'PLATFORM' "$test_root/doc.out" || { printf 'FAIL doctor platform section\n'; ((errors+=1)); }
+    DEPENDENCIES[kubectl]='NOT INSTALLED'
+    doctor_report > "$test_root/docfail.out" 2>/dev/null; rc=$?
+    [[ $rc == 1 ]] || { printf 'FAIL doctor no-kubectl exit expected 1 observed %s\n' "$rc"; ((errors+=1)); }
+    grep -q 'not installed; every cluster feature is unavailable' "$test_root/docfail.out" || { printf 'FAIL doctor no-kubectl finding\n'; ((errors+=1)); }
+    DEPENDENCIES[kubectl]=AVAILABLE
+    # Quiet mode keeps findings, drops guidance sections.
+    QUIET_FLAG=1
+    triage_report > "$test_root/quiet.out" 2>/dev/null || :
+    grep -q 'SUGGESTED NEXT CHECKS' "$test_root/quiet.out" && { printf 'FAIL quiet kept guidance section\n'; ((errors+=1)); }
+    grep -q '^TOP PRESSURE' "$test_root/quiet.out" && { printf 'FAIL quiet kept top pressure section\n'; ((errors+=1)); }
+    grep -q 'CrashLoopBackOff' "$test_root/quiet.out" || { printf 'FAIL quiet dropped findings\n'; ((errors+=1)); }
+    QUIET_FLAG=0
+    # JSON emitter: valid object, preamble as fields, numeric exit_status.
+    printf 'TITLE | fixture-time\nContext: fixture-context | Namespace: fixture-ns\nBODY LINE 1\nBODY LINE 2\n' > "$test_root/json-source.txt"
+    if ! json_report_emit "$test_root/json-source.txt" 'Triage' 1 | jq -e '.title=="Triage" and .exit_status==1 and (.lines|index("BODY LINE 1")!=null) and (.lines|index("TITLE | fixture-time")==null)' >/dev/null; then
+        printf 'FAIL json emitter structure\n'; ((errors+=1))
+    fi
+    if ((errors)); then printf 'FAIL triage fixtures: %s failures\n' "$errors"; exit 1; fi
+    printf 'PASS triage, workload correlation, capabilities, doctor, quiet and json emitter fixtures\n'
 )
 
 # 12 GitOps collectors and deployment validation
@@ -2878,6 +3334,29 @@ dev_self_test() {
     dev_test_equal TERMINAL_WIDTH_80 80 "$actual"
     actual=$(COLUMNS=160 LINES=40 TERM=dumb terminal_size; printf '%s' "$UI_COLS")
     dev_test_equal TERMINAL_WIDTH_160 160 "$actual"
+    actual=0
+    ( parse_cli --triage --namespace fixture-ns ) || actual=$?
+    dev_test_equal CLI_TRIAGE_MODE 0 "$actual"
+    actual=0
+    ( parse_cli --triage-workload fixture --namespace fixture-ns ) || actual=$?
+    dev_test_equal CLI_TRIAGE_WORKLOAD 0 "$actual"
+    actual=0
+    ( parse_cli --triage-workload Deployment/fixture --namespace fixture-ns ) || actual=$?
+    dev_test_equal CLI_TRIAGE_WORKLOAD_KIND 0 "$actual"
+    actual=0
+    ( parse_cli --triage-workload 'Bad Name' --namespace fixture-ns ) 2>/dev/null || actual=$?
+    dev_test_equal CLI_TRIAGE_WORKLOAD_INVALID 2 "$actual"
+    actual=0
+    ( parse_cli --triage-workload ) 2>/dev/null || actual=$?
+    dev_test_equal CLI_TRIAGE_WORKLOAD_NO_VALUE 2 "$actual"
+    actual=0
+    ( parse_cli --health --triage ) 2>/dev/null || actual=$?
+    dev_test_equal CLI_DUAL_MODE 2 "$actual"
+    actual=0
+    ( parse_cli --health --json --quiet --namespace fixture-ns ) || actual=$?
+    dev_test_equal CLI_JSON_QUIET_FLAGS 0 "$actual"
+    dev_test_equal NEXT_CHECK_GITOPS 'GitOps drift (dashboard 12) and deployment validation chain' "$(next_check_hint GITOPS)"
+    dev_test_equal NEXT_CHECK_DEFAULT 'Full health audit (--health) and diagnostics (dashboard 15)' "$(next_check_hint BOGUS_CATEGORY)"
     dev_test_status CACHE_TTL_BOUNDARY 0 dev_cache_fixture
     dev_test_status FIELD_REJECT_SECRET 1 splunk_field_safe client_secret
     dev_test_status FIELD_REJECT_TOKEN 1 splunk_field_safe access_token
@@ -2899,9 +3378,10 @@ dev_self_test() {
         dev_test_status SPLUNK_RESPONSE_FIXTURES_20 0 splunk_self_tests
         dev_test_status RESOURCE_REPORT_FIXTURES 0 resource_integration_tests
         dev_test_status GITOPS_CERTIFICATE_FIXTURES 0 gitops_certificate_self_tests
+        dev_test_status TRIAGE_CAPABILITY_DOCTOR_FIXTURES 0 triage_integration_tests
     else
-        printf '%-40s SKIP (jq not installed)\n' CORE_BOOTSTRAP_CACHE_FIXTURES SPLUNK_RESPONSE_FIXTURES_20 RESOURCE_REPORT_FIXTURES GITOPS_CERTIFICATE_FIXTURES
-        ((DEV_TEST_SKIPPED+=4))
+        printf '%-40s SKIP (jq not installed)\n' CORE_BOOTSTRAP_CACHE_FIXTURES SPLUNK_RESPONSE_FIXTURES_20 RESOURCE_REPORT_FIXTURES GITOPS_CERTIFICATE_FIXTURES TRIAGE_CAPABILITY_DOCTOR_FIXTURES
+        ((DEV_TEST_SKIPPED+=5))
     fi
     if has git; then dev_test_status PUBLICATION_SAFETY_FIXTURES_12 0 developer_publish_self_tests
     else printf '%-40s SKIP (git not installed)\n' PUBLICATION_SAFETY_FIXTURES_12; ((DEV_TEST_SKIPPED+=1)); fi
@@ -3682,6 +4162,35 @@ export_file() {
     printf 'EXPORTED %s\n' "$path"
     log_audit "export=$path status=OK"
 }
+json_report_emit() {
+    # Machine-readable projection of a captured report for --json. The two
+    # capture preamble lines are represented as fields, not repeated inline.
+    local file=$1 title=$2 status=$3
+    [[ -f $file ]] || return 2
+    [[ $status =~ ^[0-9]+$ ]] || status=0
+    if ! has jq; then
+        printf 'UNAVAILABLE: --json requires jq; plain text follows\n' >&2
+        tail -n +3 -- "$file"
+        return 0
+    fi
+    tail -n +3 -- "$file" | redact | jq -Rs \
+        --arg application "$APP_NAME" --arg version "$APP_VERSION" --arg title "$title" \
+        --arg context "$SENTINEL_CONTEXT" --arg namespace "$SENTINEL_NAMESPACE" \
+        --arg collected "$(timestamp)" --argjson status "$status" \
+        '{application:$application,version:$version,title:$title,context:$context,namespace:$namespace,collected:$collected,exit_status:$status,lines:split("\n")}'
+}
+cli_report_output() {
+    # Shared noninteractive emitter: default full text, --quiet without the
+    # two-line capture preamble, --json as one machine-readable object.
+    local title=$1 rc=$2
+    if ((JSON_FLAG)); then
+        json_report_emit "$CURRENT_REPORT" "$title" "$rc"
+    elif ((QUIET_FLAG)); then
+        tail -n +3 -- "$CURRENT_REPORT"
+    else
+        cat -- "$CURRENT_REPORT"
+    fi
+}
 format_table() {
     local width=${1:-$UI_COLS}
     if ! has awk; then
@@ -4048,6 +4557,10 @@ Refresh: pods/metrics 5s, events 10s, Flux/Helm 15s, certificates 60s, discovery
 Live keys: p pause, r force, +/- rate, / regex filter, s sort, i triage, e export, f full.
 Tables hide lower-priority columns at narrow widths. Full output wraps and pages all data.
 Readiness counts observed OK/WARN/FAIL/UNKNOWN findings; it is not a health percentage.
+Triage: --triage is a concise namespace incident scope; --triage-workload NAME
+correlates one workload with pods, events, services, storage and GitOps.
+--capabilities shows what this environment supports; --doctor diagnoses the tool itself.
+--json emits machine-readable report objects (requires jq); --quiet trims guidance.
 Missing permissions, API errors and missing metrics are explicit, never interpreted as zero.
 GitOps: generation/revision differences can be reconciliation lag. Desired manifests are
 not downloaded; runtime variance is not proof of Git desired-state drift.
@@ -4071,6 +4584,7 @@ dashboard_report() {
     printf '[ 6] Health / Readiness                 [12] GitOps Drift\n'
     printf '[13] Full Output / Logs                 [14] Change Scope\n'
     printf '[15] Dependency / RBAC diagnostics      [16] Help\n'
+    printf '[17] Triage digest (namespace scope)\n'
     printf '[/] Global search                      [ 0] Secure exit\n'
 }
 dashboard() {
@@ -4082,7 +4596,7 @@ dashboard() {
         paint_report "$CURRENT_REPORT"
         [[ -n $last_report ]] && CURRENT_REPORT=$last_report
         selection=
-        if ((UI_ACTIVE)); then printf '\033[%s;1H\033[2KSelect [0-16, /]: \033[?25h' "$UI_ROWS"; fi
+        if ((UI_ACTIVE)); then printf '\033[%s;1H\033[2KSelect [0-17, /]: \033[?25h' "$UI_ROWS"; fi
         if ((REFRESH>0)); then
             IFS= read -r -t "$REFRESH" selection; rc=$?
             if ((rc>128)); then continue; elif ((rc!=0)); then break; fi
@@ -4104,6 +4618,7 @@ dashboard() {
                 rm -f -- "$CACHE_DIR"/*.json "$CACHE_DIR"/*.txt "$CACHE_DIR"/*.status "$CACHE_DIR"/*.time "$CACHE_DIR"/*.error
                 bootstrap_scope || { rc=$?; break; };;
             15) show_report Diagnostics diagnostics_report;; 16|h|help) show_report Help module_help;;
+            17|t) show_report Triage triage_report;;
             /) global_search;;
         esac
         last_report=$CURRENT_REPORT
@@ -4169,6 +4684,12 @@ Usage: ./KubeOps_Sentinel.sh [options]
   --namespace NAME       Lock namespace (required for noninteractive cluster commands)
   --refresh 0|2|5|10|15|30|60   Seconds; 0 = manual (default 5)
   --health | --resources | --gitops | --certificates | --evidence ID
+  --triage                 Concise one-command incident scope (health + findings + next checks)
+  --triage-workload NAME   Workload correlation: pods, events, services, storage, GitOps
+  --capabilities           Dynamic capability matrix: tools, APIs, RBAC, optional systems
+  --doctor                 Diagnose whether Sentinel itself can operate in this environment
+  --json                   Machine-readable object for report commands (requires jq)
+  --quiet                  Essential output only: no preamble, no guidance sections
   --output DIR           Local working-directory descendant for private runtime/export files
   --api-timeout SECONDS  --log-timeout SECONDS --tls-timeout SECONDS
   --cert-warn-days DAYS  --cert-critical-days DAYS
@@ -4177,7 +4698,8 @@ Usage: ./KubeOps_Sentinel.sh [options]
 Environment: SNTL_CONTEXT, SNTL_NAMESPACE, SNTL_REFRESH, SNTL_OUTPUT_DIR,
              SPLUNK_URL, SPLUNK_INDEX, SPLUNK_SOURCETYPE, SPLUNK_TOKEN (never persisted).
 Exit: 0 no operational FAIL; 1 observed operational FAIL; 2 usage/configuration;
-      3 authentication/API failure. UNKNOWN is reported, not counted as healthy.
+      3 authentication/API failure; 4 triage modes only: required data unavailable.
+      UNKNOWN is reported, never counted as healthy or zero.
 TXT/CSV exports preserve full report lines. JSON report exports require optional jq.
 HELP
 }
@@ -4213,9 +4735,14 @@ parse_cli() {
             --help|-h) usage; return 10;; --help-dev) usage_dev; return 10;;
             --version) printf '%s %s (%s)\n' "$APP_NAME" "$APP_VERSION" "$APP_BUILD"; return 10;;
             --no-color) NO_COLOR_FLAG=1;;
-            --health|--resources|--gitops|--certificates|--dev-info|--dev-validate|--dev-self-test|--dev-smoke|--dev-watch|--dev-git-status|--dev-git-diff|--dev-publish|--dev-flux-verify|--dev-release|--dev-fix-line-endings|--dev-fix-permissions|--dev-install-hook)
+            --health|--resources|--gitops|--certificates|--triage|--capabilities|--doctor|--dev-info|--dev-validate|--dev-self-test|--dev-smoke|--dev-watch|--dev-git-status|--dev-git-diff|--dev-publish|--dev-flux-verify|--dev-release|--dev-fix-line-endings|--dev-fix-permissions|--dev-install-hook)
                 ((mode_set==0)) || { printf 'Select exactly one command mode\n' >&2; return 2; }; MODE=${opt#--}; mode_set=1;;
             --evidence) cli_need_value "$@" || return; ((mode_set==0)) || return 2; MODE=evidence EVIDENCE_ID=$2 mode_set=1; shift;;
+            --triage-workload) cli_need_value "$@" || return; ((mode_set==0)) || return 2
+                [[ $2 =~ ^([A-Za-z][A-Za-z0-9.-]*/)?[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] || { printf 'Invalid workload name\n' >&2; return 2; }
+                MODE=triage-workload TRIAGE_WORKLOAD=$2 mode_set=1; shift;;
+            --json) JSON_FLAG=1;;
+            --quiet) QUIET_FLAG=1;;
             --kubeconfig) cli_need_value "$@" || return; export KUBECONFIG=$2; KUBECONFIG_MODE=EXPLICIT; shift;;
             --context) cli_need_value "$@" || return; SENTINEL_CONTEXT=$2; shift;;
             --namespace) cli_need_value "$@" || return; SENTINEL_NAMESPACE=$2; shift;;
@@ -4266,13 +4793,23 @@ main() {
         "$command_fn"; return $?
     fi
     if [[ $MODE == dashboard && $INTERACTIVE == 0 ]]; then printf 'Dashboard needs a terminal; use --health or --resources for noninteractive output.\n' >&2; return 2; fi
-    bootstrap_scope || return
+    if [[ $MODE == doctor || $MODE == capabilities ]]; then
+        # Diagnostic modes must complete even when scope bootstrap fails; the
+        # failure itself becomes an explicit doctor/capability finding.
+        bootstrap_scope || DOCTOR_BOOTSTRAP_RC=$?
+    else
+        bootstrap_scope || return
+    fi
     case $MODE in
         dashboard) dashboard;;
-        resources) capture_report Resources resources_report; rc=$?; cat "$CURRENT_REPORT"; return "$rc";;
-        health) capture_report Health health_report; rc=$?; cat "$CURRENT_REPORT"; return "$rc";;
-        gitops) capture_report GitOps gitops_report; rc=$?; cat "$CURRENT_REPORT"; return "$rc";;
-        certificates) capture_report Certificates certificates_report; rc=$?; cat "$CURRENT_REPORT"; return "$rc";;
+        resources) capture_report Resources resources_report; rc=$?; cli_report_output Resources "$rc"; return "$rc";;
+        health) capture_report Health health_report; rc=$?; cli_report_output Health "$rc"; return "$rc";;
+        gitops) capture_report GitOps gitops_report; rc=$?; cli_report_output GitOps "$rc"; return "$rc";;
+        certificates) capture_report Certificates certificates_report; rc=$?; cli_report_output Certificates "$rc"; return "$rc";;
+        triage) capture_report Triage triage_report; rc=$?; cli_report_output Triage "$rc"; return "$rc";;
+        triage-workload) capture_report 'Workload triage' triage_workload_report "$TRIAGE_WORKLOAD"; rc=$?; cli_report_output 'Workload triage' "$rc"; return "$rc";;
+        capabilities) capture_report Capabilities capabilities_report; rc=$?; cli_report_output Capabilities "$rc"; return "$rc";;
+        doctor) capture_report Doctor doctor_report; rc=$?; cli_report_output Doctor "$rc"; return "$rc";;
         evidence) evidence_create "$EVIDENCE_ID" 9;;
     esac
 }
