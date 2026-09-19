@@ -9,23 +9,77 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: kubeops-sentinel-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  deterministic-validation:
+  production-validation:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+    env:
+      TERM: dumb
+      LC_ALL: C.UTF-8
     steps:
-      - uses: actions/checkout@v4
-      - name: Preserve executable bit check
-        run: test -x KubeOps_Sentinel.sh
-      - name: Bash syntax
-        run: bash -n KubeOps_Sentinel.sh
-      - name: Deterministic self-tests
-        env:
-          TERM: dumb
-        run: ./KubeOps_Sentinel.sh --dev-self-test --output ./sentinel-output
+      - name: Checkout without persisted credentials
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Executable and syntax gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x KubeOps_Sentinel.sh
+          mapfile -t scripts < <(git ls-files '*.sh')
+          ((${#scripts[@]} > 0))
+          for script in "${scripts[@]}"; do
+            test -x "$script"
+            bash -n "$script"
+          done
+
+      - name: ShellCheck error gate when available
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v shellcheck >/dev/null 2>&1; then
+            mapfile -t scripts < <(git ls-files '*.sh')
+            shellcheck --severity=error "${scripts[@]}"
+          else
+            echo 'ShellCheck not preinstalled on this runner; embedded static safety remains mandatory.'
+          fi
+
+      - name: Repository safety policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          tracked=$(git ls-files 'sentinel-output/**' '.sentinel-dev/validation.*.log' '.sentinel-dev/image/**' '.sentinel-dev/*.lock' '.sentinel-dev/*.tmp')
+          if [[ -n "$tracked" ]]; then
+            echo 'Generated runtime/test artifacts are tracked unexpectedly:'
+            printf '%s\n' "$tracked"
+            exit 1
+          fi
+          matches=$(git grep -nE -- '-----BEGIN ([A-Z0-9 ]+ )?PRIVATE KEY-----|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{20,}' -- ':!sentinel-output/**' 2>/dev/null | grep -vi 'fixture' || true)
+          if [[ -n "$matches" ]]; then
+            echo 'Potential credential/private-key material found in tracked content:'
+            printf '%s\n' "$matches"
+            exit 1
+          fi
+
+      - name: Full developer validation gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          git checkout -B ci-validation "$GITHUB_SHA"
+          ./KubeOps_Sentinel.sh --dev-validate --non-interactive --output ./sentinel-output
+
       - name: TLS and GitOps loopback E2E
-        env:
-          TERM: dumb
-        run: ./.sentinel-dev/e2e/tls-live-test.sh
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./.sentinel-dev/e2e/tls-live-test.sh
+
       - name: Repository whitespace check
+        shell: bash
         run: git diff --check

@@ -4,6 +4,9 @@
 # Developer publishing is isolated; the only cluster write exception is an
 # explicitly guarded post-push Flux reconciliation in developer release mode.
 # Changelog (compact):
+#   1.1.1 Production hardening: DNS/TLS error classes, expanded credential
+#         redaction, native-Linux developer validation, source/kubeconfig
+#         hygiene checks, stronger deterministic security fixtures.
 #   1.1.0 One-command triage (--triage, --triage-workload), capability report
 #         (--capabilities), Sentinel doctor (--doctor), --json machine-readable
 #         output, --quiet, exit code 4 for unavailable required data, next-check
@@ -16,7 +19,7 @@ umask 077
 
 # 01 Constants and session state
 APP_NAME="KubeOps Sentinel"
-APP_VERSION="1.1.0"
+APP_VERSION="1.1.1"
 APP_BUILD="production"
 SOURCE_FILE="${BASH_SOURCE[0]}"
 SENTINEL_CONTEXT="${SNTL_CONTEXT:-}"
@@ -62,7 +65,11 @@ color_init() {
 }
 status_label() {
     local color=$C_CYAN
-    case $1 in OK|PASS|AUTHENTICATED) color=$C_GREEN;; WARN|DEGRADED|UNKNOWN) color=$C_YELLOW;; FAIL|EXPIRED|CRITICAL|AUTH_ERROR|RBAC_DENIED) color=$C_RED;; esac
+    case $1 in
+        OK|PASS|AUTHENTICATED) color=$C_GREEN;;
+        WARN|DEGRADED|UNKNOWN) color=$C_YELLOW;;
+        FAIL|EXPIRED|CRITICAL|AUTH_ERROR|RBAC_DENIED|DNS_ERROR|TLS_ERROR|NETWORK_ERROR|API_TIMEOUT) color=$C_RED;;
+    esac
     printf '%s[%s]%s' "$color" "$1" "$C_RESET"
 }
 rule() { local line; printf -v line '%*s' "$((UI_COLS-1))" ''; printf '%s\n' "${line// /=}"; }
@@ -99,8 +106,10 @@ redact() {
             low=${line,,}
             if [[ $low == *'-----begin '*'private key-----'* ]]; then pem=1; printf '[REDACTED PRIVATE KEY]\n'; continue; fi
             if ((pem)); then [[ $low == *'-----end '*'private key-----'* ]] && pem=0; continue; fi
-            case $low in *authorization*|*bearer*|*token*|*password*|*passwd*|*secret=*|*apikey*|*api_key*|*client_secret*|*://*@*|*eyj*) printf '[REDACTED]\n';;
-                *) printf '%s\n' "$line";; esac
+            case $low in
+                *authorization*|*bearer*|*token*|*password*|*passwd*|*secret=*|*apikey*|*api_key*|*client_secret*|*access_key*|*secret_access_key*|*session_token*|*private_key*|*client-key-data*|*://*@*|*eyj*|*ghp_*|*github_pat_*|*glpat-*|*xoxb-*|*xoxp-*) printf '[REDACTED]\n';;
+                *) printf '%s\n' "$line";;
+            esac
         done
         return
     fi
@@ -120,9 +129,11 @@ redact() {
       }
       gsub(/\[REDACTED\]_AT_/, "[REDACTED]@",s)
       low=tolower(s)
-      if (match(low, /(authorization["\047 ]*[:=]|bearer[[:space:]]+|(^|[^a-z0-9_])(token|password|passwd|secret|apikey|api_key|client_secret|access_token|refresh_token|id_token)["\047 ]*[:=])/))
+      if (match(low, /(authorization["\047 ]*[:=]|bearer[[:space:]]+|(^|[^a-z0-9_])(token|password|passwd|secret|apikey|api_key|client_secret|access_token|refresh_token|id_token|access_key|access_key_id|secret_access_key|session_token|aws_access_key_id|aws_secret_access_key|aws_session_token|private_key|client_key|client-key-data)["\047 ]*[:=])/))
         s=substr(s,1,RSTART-1) "[REDACTED]"
       if (match(s, /eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/))
+        s=substr(s,1,RSTART-1) "[REDACTED]" substr(s,RSTART+RLENGTH)
+      if (match(s, /(gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{20,})/))
         s=substr(s,1,RSTART-1) "[REDACTED]" substr(s,RSTART+RLENGTH)
       print s
     }'
@@ -155,7 +166,9 @@ classify_error() {
     case $message in
         *forbidden*|*'cannot list'*|*'cannot get'*|*'permission denied'*) printf 'RBAC_DENIED\n';;
         *unauthorized*|*'provide credentials'*|*'must be logged'*|*'token has expired'*|*'invalid_grant'*|*'credential'*|*'exec plugin'*|*'authentication'*) printf 'AUTH_ERROR\n';;
-        *'connection refused'*|*'unable to connect'*|*'no such host'*|*'network is unreachable'*|*'x509:'*|*'tls handshake'*) printf 'NETWORK_ERROR\n';;
+        *'no such host'*|*'could not resolve host'*|*'temporary failure in name resolution'*|*'name or service not known'*|*'server misbehaving'*) printf 'DNS_ERROR\n';;
+        *'x509:'*|*'tls handshake'*|*'certificate verify failed'*|*'certificate signed by unknown authority'*|*'unable to get local issuer certificate'*|*'hostname mismatch'*|*'certificate has expired'*) printf 'TLS_ERROR\n';;
+        *'connection refused'*|*'unable to connect'*|*'network is unreachable'*|*'connection reset'*|*'no route to host'*) printf 'NETWORK_ERROR\n';;
         *'timed out'*|*'deadline exceeded'*|*'timeout exceeded'*|*'i/o timeout'*|*'request timeout'*|*'timeout awaiting'*) printf 'API_TIMEOUT\n';;
         *'no matches for kind'*|*'not found'*|*'have a resource type'*|*'could not find the requested resource'*) printf 'RESOURCE_NOT_FOUND\n';;
         *'metrics api not available'*|*'metrics not available'*) printf 'METRICS_UNAVAILABLE\n';;
@@ -229,7 +242,7 @@ cleanup() {
 # 05 Dependencies and private local runtime
 dependency_detect() {
     local cmd
-    for cmd in kubectl helm flux jq openssl curl timeout sha256sum column tput base64 awk sed grep sort uniq date less git shellcheck inotifywait flock; do
+    for cmd in kubectl helm flux jq openssl curl timeout sha256sum column tput base64 awk sed grep sort uniq date less git shellcheck inotifywait flock stat id uname file; do
         if has "$cmd"; then DEPENDENCIES[$cmd]=AVAILABLE; else DEPENDENCIES[$cmd]='NOT INSTALLED'; fi
     done
 }
@@ -350,11 +363,14 @@ json_sanitize() {
     # contain credentials; sanitize strings without breaking JSON escaping.
     jq '
       def clean:
-        if type=="object" then with_entries(select(.key | test("^(data|stringData|managedFields|password|passwd|token|access_token|refresh_token|client_secret|privateKey|tls.key)$";"i")|not) | .value |= clean)
+        if type=="object" then with_entries(select(.key | test("^(data|stringData|managedFields|password|passwd|token|access_token|refresh_token|id_token|client_secret|access_key|access_key_id|secret_access_key|session_token|aws_access_key_id|aws_secret_access_key|aws_session_token|privateKey|private_key|client_key|client-key-data|tls.key)$";"i")|not) | .value |= clean)
         elif type=="array" then map(clean)
         elif type=="string" then
-          if test("BEGIN .*PRIVATE KEY|authorization[\" ]*[:=]|bearer[[:space:]]+|(^|[^a-z0-9_])(token|password|passwd|secret|apikey|api_key|client_secret)[\" ]*[:=]";"i") then "[REDACTED]"
-          else gsub("(?<s>[a-zA-Z][a-zA-Z0-9+.-]*://)[^/ @]*@";"\(.s)[REDACTED]@") | gsub("eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+";"[REDACTED]") | gsub("[\u0000-\u0008\u000b-\u001f\u007f]";"") end
+          if test("BEGIN .*PRIVATE KEY|authorization[\" ]*[:=]|bearer[[:space:]]+|(^|[^a-z0-9_])(token|password|passwd|secret|apikey|api_key|client_secret|access_key|access_key_id|secret_access_key|session_token|aws_access_key_id|aws_secret_access_key|aws_session_token|private_key|client_key|client-key-data)[\" ]*[:=]";"i") then "[REDACTED]"
+          else gsub("(?<s>[a-zA-Z][a-zA-Z0-9+.-]*://)[^/ @]*@";"\(.s)[REDACTED]@") |
+               gsub("eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+";"[REDACTED]") |
+               gsub("(gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{20,})";"[REDACTED]") |
+               gsub("[\u0000-\u0008\u000b-\u001f\u007f]";"") end
         else . end; clean'
 }
 collect_json() {
@@ -610,8 +626,8 @@ core_integration_tests() (
     mkdir "$CACHE_DIR/overlap.lock" || return 1
     collect_json overlap 5 ns pods "$JQ_SAFE_POD" && return 1
     local output
-    output=$(printf '%s\n' '{"password":"fixture-omit-password","nested":{"token":"fixture-omit-token","text":"Authorization: fixture-omit-auth"},"image":"safe"}' | json_sanitize) || return 1
-    [[ $output != *fixture-omit* && $output == *safe* ]] || return 1
+    output=$(printf '%s\n' '{"password":"fixture-omit-password","aws_secret_access_key":"fixture-omit-aws","nested":{"token":"fixture-omit-token","text":"Authorization: fixture-omit-auth","pat":"ghp_1234567890abcdefghijklmnopqrstuv"},"image":"safe"}' | json_sanitize) || return 1
+    [[ $output != *fixture-omit* && $output != *ghp_1234567890* && $output == *safe* ]] || return 1
     export KUBECONFIG='/fixture/one config:/fixture/two'
     KUBECONFIG_MODE=EXPLICIT CORE_FIXTURE_MODE=namespace-denied
     bootstrap_scope >/dev/null 2>&1 || return 1
@@ -1176,7 +1192,7 @@ health_report() {
     if declare -F certificates_report >/dev/null; then certificates_report >/dev/null; fi
     printf 'KUBERNETES HEALTH & READINESS\nCONTEXT\t%s\nNAMESPACE\t%s\nTIME\t%s\n' "$SENTINEL_CONTEXT" "$SENTINEL_NAMESPACE" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     printf 'AUTHENTICATION\t%s\nAPI\t%s\nAPI LATENCY\t%s\nRBAC\t%s\n' "${AUTH_STATUS:-UNKNOWN}" "${API_STATUS:-UNKNOWN}" "${API_LATENCY:-UNKNOWN}" "${RBAC_STATUS:-UNKNOWN}"
-    case ${AUTH_STATUS:-UNKNOWN}:${API_STATUS:-UNKNOWN} in *AUTH_ERROR*|*AUTH_REQUIRED*|*NETWORK_ERROR*|*API_TIMEOUT*) overall=3 ;; esac
+    case ${AUTH_STATUS:-UNKNOWN}:${API_STATUS:-UNKNOWN} in *AUTH_ERROR*|*AUTH_REQUIRED*|*DNS_ERROR*|*TLS_ERROR*|*NETWORK_ERROR*|*API_TIMEOUT*) overall=3 ;; esac
     printf 'CATEGORY\tCOLLECTOR STATUS\tCACHE AGE (sec)\n'
     for key in pods workloads services endpointslices endpoints ingresses pvcs pvs storageclasses volumeattachments events nodes metrics nodemetrics flux_gitrepositories flux_kustomizations flux_helmrepositories flux_helmreleases helm cert_certificates cert_certificaterequests cert_issuers cert_clusterissuers tls_certificates; do
         state=$(cache_status "$key")
@@ -1185,7 +1201,7 @@ health_report() {
             OK|EMPTY_RESULT) ((ok+=1)) ;;
             RESOURCE_NOT_FOUND|NOT_CONFIGURED)
                 case $key in flux_*|cert_*|endpointslices|endpoints) findings_add INFO CAPABILITY "$key" 'Not installed or not served' "$state" ;; *) ((unknown+=1)); findings_add UNKNOWN CAPABILITY "$key" 'Data unavailable' "$state" ;; esac ;;
-            AUTH_ERROR|AUTH_REQUIRED|NETWORK_ERROR|API_TIMEOUT) overall=3; ((unknown+=1)); findings_add UNKNOWN API "$key" 'Collector unavailable' "$state" ;;
+            AUTH_ERROR|AUTH_REQUIRED|DNS_ERROR|TLS_ERROR|NETWORK_ERROR|API_TIMEOUT) overall=3; ((unknown+=1)); findings_add UNKNOWN API "$key" 'Collector unavailable' "$state" ;;
             *) ((unknown+=1)); findings_add UNKNOWN CAPABILITY "$key" 'Coverage unavailable; no healthy/zero claim' "$state" ;;
         esac
     done
@@ -1445,7 +1461,7 @@ capabilities_report() {
     printf 'CAPABILITY REPORT | dynamically determined; menus adapt automatically\nCONTEXT\t%s\nNAMESPACE\t%s\nTIME\t%s\n' \
         "$SENTINEL_CONTEXT" "$SENTINEL_NAMESPACE" "$(timestamp)"
     printf '\nLOCAL TOOLS\n'
-    for cmd in kubectl helm flux jq openssl curl timeout sha256sum column tput base64 awk sed grep sort uniq date git shellcheck inotifywait flock less; do
+    for cmd in kubectl helm flux jq openssl curl timeout sha256sum column tput base64 awk sed grep sort uniq date git shellcheck inotifywait flock less stat id uname file; do
         printf '%-14s %s\n' "$cmd" "${DEPENDENCIES[$cmd]:-UNKNOWN}"
     done
     printf '\nCLUSTER ACCESS\n'
@@ -1474,6 +1490,87 @@ capabilities_report() {
     return 0
 }
 
+doctor_source_hygiene() {
+    local failed=0 mode hash
+    if [[ ! -e $SOURCE_FILE ]]; then
+        printf 'Source file\tFAIL\tmissing: %s\n' "$SOURCE_FILE"
+        return 1
+    fi
+    if [[ -L $SOURCE_FILE ]]; then
+        printf 'Source file\tWARN\tsymlink execution path; verify repository provenance\n'
+    elif [[ -f $SOURCE_FILE ]]; then
+        printf 'Source file\tOK\tregular file\n'
+    else
+        printf 'Source file\tFAIL\tnot a regular file\n'; failed=1
+    fi
+    if has stat; then
+        mode=$(stat -Lc '%a' -- "$SOURCE_FILE" 2>/dev/null || true)
+        if [[ $mode =~ ^[0-7]{3,4}$ ]]; then
+            if (((8#$mode & 0022) != 0)); then
+                printf 'Source permissions\tFAIL\tmode=%s is group/world writable\n' "$mode"; failed=1
+            else
+                printf 'Source permissions\tOK\tmode=%s\n' "$mode"
+            fi
+        else
+            printf 'Source permissions\tUNKNOWN\tstat mode unavailable\n'
+        fi
+    else
+        printf 'Source permissions\tUNKNOWN\tstat not installed\n'
+    fi
+    if has sha256sum; then
+        hash=$(sha256sum -- "$SOURCE_FILE" 2>/dev/null | awk '{print $1}')
+        if [[ $hash =~ ^[a-fA-F0-9]{64}$ ]]; then printf 'Source SHA256\tOK\t%s\n' "$hash"
+        else printf 'Source SHA256\tUNKNOWN\tunable to calculate\n'; fi
+    else
+        printf 'Source SHA256\tUNAVAILABLE\tsha256sum not installed\n'
+    fi
+    return "$failed"
+}
+
+doctor_kubeconfig_hygiene() {
+    local failed=0 entry mode seen=0
+    local -a entries=()
+    if [[ $KUBECONFIG_MODE != EXPLICIT ]]; then
+        printf 'Kubeconfig hygiene\tDEFAULT\tkubectl default resolution; explicit file permissions not inspected\n'
+        return 0
+    fi
+    if [[ -z ${KUBECONFIG:-} ]]; then
+        printf 'Kubeconfig hygiene\tFAIL\texplicit mode with empty KUBECONFIG\n'
+        return 1
+    fi
+    IFS=: read -r -a entries <<< "$KUBECONFIG"
+    for entry in "${entries[@]}"; do
+        [[ -n $entry ]] || { printf 'Kubeconfig entry\tWARN\tempty path component ignored\n'; continue; }
+        ((seen+=1))
+        if [[ ! -e $entry ]]; then
+            printf 'Kubeconfig entry\tFAIL\t%s does not exist\n' "$entry"; failed=1; continue
+        fi
+        if [[ ! -f $entry || ! -r $entry ]]; then
+            printf 'Kubeconfig entry\tFAIL\t%s must be a readable regular file\n' "$entry"; failed=1; continue
+        fi
+        if has stat; then
+            mode=$(stat -Lc '%a' -- "$entry" 2>/dev/null || true)
+            if [[ $mode =~ ^[0-7]{3,4}$ ]]; then
+                if (((8#$mode & 0022) != 0)); then
+                    printf 'Kubeconfig permissions\tFAIL\t%s mode=%s is group/world writable\n' "$entry" "$mode"; failed=1
+                elif (((8#$mode & 0004) != 0)); then
+                    printf 'Kubeconfig permissions\tWARN\t%s mode=%s is world-readable\n' "$entry" "$mode"
+                elif (((8#$mode & 0040) != 0)); then
+                    printf 'Kubeconfig permissions\tWARN\t%s mode=%s is group-readable\n' "$entry" "$mode"
+                else
+                    printf 'Kubeconfig permissions\tOK\t%s mode=%s\n' "$entry" "$mode"
+                fi
+            else
+                printf 'Kubeconfig permissions\tUNKNOWN\t%s stat mode unavailable\n' "$entry"
+            fi
+        else
+            printf 'Kubeconfig permissions\tUNKNOWN\t%s; stat not installed\n' "$entry"
+        fi
+    done
+    ((seen>0)) || { printf 'Kubeconfig hygiene\tFAIL\tno usable explicit path entries\n'; return 1; }
+    return "$failed"
+}
+
 doctor_report() {
     local failed=0 rc raw contexts=0 cmd core_missing=0 rc_ok=0 rc_bad=0 rc_res=0
     printf 'SENTINEL DOCTOR | diagnoses whether this tool can operate here\nTIME\t%s\nHOST\t%s\nSHELL\t%s\n' \
@@ -1487,6 +1584,8 @@ doctor_report() {
     done
     ((core_missing)) && failed=1
     ((core_missing)) || printf 'Core utilities\tOK\tmktemp mkdir rm cat awk sed grep sort uniq date present\n'
+    printf '\nSOURCE INTEGRITY\n'
+    doctor_source_hygiene || failed=1
     printf '\nOPTIONAL TOOLS (impact when missing)\n'
     if [[ ${DEPENDENCIES[jq]:-UNKNOWN} == AVAILABLE ]]; then printf 'jq\tOK\tJSON analysis, structured reports, --json output\n'
     else printf 'jq\tWARN\tstructured analysis and --json output unavailable\n'; fi
@@ -1517,6 +1616,7 @@ doctor_report() {
         failed=1
     fi
     printf 'KUBECONFIG MODE\t%s (never modified by this tool)\n' "$KUBECONFIG_MODE"
+    doctor_kubeconfig_hygiene || failed=1
     printf '\nCLUSTER SCOPE\n'
     if [[ $SCOPE_READY == 1 ]]; then
         printf 'Scope bootstrap\tOK\tcontext=%s namespace=%s\n' "$SENTINEL_CONTEXT" "$SENTINEL_NAMESPACE"
@@ -1908,7 +2008,7 @@ gitops_certificate_collection_rc() {
     for key in "$@"; do
         state="$(cache_status "$key")"
         case "$state" in
-            AUTH_ERROR|API_TIMEOUT|NETWORK_ERROR) result=3 ;;
+            AUTH_ERROR|API_TIMEOUT|DNS_ERROR|TLS_ERROR|NETWORK_ERROR) result=3 ;;
             RBAC_DENIED|PARSE_ERROR|COMMAND_MISSING|UNKNOWN) ((result<2)) && result=2 ;;
         esac
     done
@@ -3060,9 +3160,11 @@ dev_is_wsl() {
 }
 
 dev_environment() {
-    local version path failed=0
+    local version path failed=0 platform
+    platform=$(uname -s 2>/dev/null || printf UNKNOWN)
     if dev_is_wsl; then printf '[PASS] WSL Linux environment\n'
-    else printf '[FAIL] Development validation requires native Linux inside WSL\n'; failed=1; fi
+    elif [[ $platform == Linux ]]; then printf '[PASS] Native Linux environment\n'
+    else printf '[FAIL] Development validation requires Linux or WSL; observed %s\n' "$platform"; failed=1; fi
     if ((BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4))); then
         printf '[PASS] Bash >= 4.4\n'
     else printf '[FAIL] Bash >= 4.4 required\n'; failed=1; fi
@@ -3251,13 +3353,13 @@ dev_static_safety() {
     if [[ -n $matches ]]; then
         printf '[FAIL] STATIC SECURITY CHECK: forbidden command pattern detected\n'; failed=1
     else printf '[PASS] STATIC SECURITY CHECK: forbidden command patterns absent\n'; fi
-    tokenword='(echo|printf)[[:space:]].*\$(TOKEN|PASSWORD|SPLUNK_TOKEN)([^[:alnum:]_]|$)|cat[[:space:]].*\.kube/config'
+    tokenword='(echo|printf)[[:space:]].*\$(TOKEN|PASSWORD|PASSWD|SPLUNK_TOKEN|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN|GITHUB_TOKEN|GH_TOKEN|CLIENT_SECRET)([^[:alnum:]_]|$)|cat[[:space:]].*\.kube/config'
     if awk '!/^[[:space:]]*#/' "$DEV_SOURCE" | grep -Eq "$tokenword"; then
         printf '[FAIL] STATIC SECURITY CHECK: obvious credential printing pattern\n'; failed=1
     else printf '[PASS] STATIC SECURITY CHECK: obvious credential printing patterns absent\n'; fi
     if ! grep -Fq 'set -o pipefail' "$DEV_SOURCE"; then printf '[FAIL] pipefail absent\n'; failed=1; fi
     local function
-    for function in kctl_ns kctl_cluster scope_args_safe redact cache_fresh bootstrap_scope resources_report health_report gitops_report certificates_report splunk_report capture_report view_file; do
+    for function in kctl_ns kctl_cluster scope_args_safe redact cache_fresh bootstrap_scope resources_report health_report gitops_report certificates_report splunk_report capture_report view_file doctor_source_hygiene doctor_kubeconfig_hygiene; do
         if ! declare -F "$function" >/dev/null; then printf '[FAIL] Function reference: %s\n' "$function"; failed=1; fi
     done
     if ((failed == 0)); then printf '[PASS] Required function references\n'; fi
@@ -3300,6 +3402,26 @@ dev_cache_fixture() (
     rmdir -- "$CACHE_DIR"
 )
 
+doctor_hygiene_self_tests() (
+    local fixture
+    fixture=$(mktemp "$RUN_DIR/doctor-kubeconfig.XXXXXX") || exit 1
+    printf '%s\n' 'apiVersion: v1' > "$fixture"
+    chmod 600 "$fixture" || exit 1
+    SOURCE_FILE=$fixture
+    KUBECONFIG_MODE=EXPLICIT
+    KUBECONFIG=$fixture
+    doctor_source_hygiene >/dev/null || exit 1
+    doctor_kubeconfig_hygiene >/dev/null || exit 1
+    chmod 666 "$fixture" || exit 1
+    doctor_source_hygiene >/dev/null 2>&1 && exit 1
+    doctor_kubeconfig_hygiene >/dev/null 2>&1 && exit 1
+    chmod 600 "$fixture" || exit 1
+    KUBECONFIG="$fixture:/definitely/missing/kubeconfig"
+    doctor_kubeconfig_hygiene >/dev/null 2>&1 && exit 1
+    rm -f -- "$fixture"
+    printf 'PASS source and kubeconfig hygiene permission fixtures\n'
+)
+
 dev_self_test() {
     DEV_TEST_TOTAL=0 DEV_TEST_PASSED=0 DEV_TEST_FAILED=0 DEV_TEST_SKIPPED=0
     local fixture actual role
@@ -3307,6 +3429,8 @@ dev_self_test() {
     dev_test_equal ERROR_AUTH AUTH_ERROR "$(classify_error 1 'Unauthorized')"
     dev_test_equal ERROR_RBAC RBAC_DENIED "$(classify_error 1 'Forbidden: cannot list pods')"
     dev_test_equal ERROR_TIMEOUT API_TIMEOUT "$(classify_error 124 '')"
+    dev_test_equal ERROR_DNS DNS_ERROR "$(classify_error 1 'dial tcp: lookup api.example.invalid: no such host')"
+    dev_test_equal ERROR_TLS TLS_ERROR "$(classify_error 1 'x509: certificate signed by unknown authority')"
     dev_test_equal ERROR_NETWORK NETWORK_ERROR "$(classify_error 1 'connection refused')"
     dev_test_equal ERROR_NETWORK_URL_TIMEOUT NETWORK_ERROR "$(classify_error 1 'Get https://example.invalid/api?timeout=10s: connect: connection refused')"
     dev_test_equal ERROR_MISSING COMMAND_MISSING "$(classify_error 127 '')"
@@ -3322,6 +3446,8 @@ dev_self_test() {
     dev_test_equal REDACTION_PASSWORD '[REDACTED]' "$(printf 'password=fixture-hidden\n' | redact)"
     dev_test_equal REDACTION_APIKEY '[REDACTED]' "$(printf 'api_key=fixture-hidden\n' | redact)"
     dev_test_equal REDACTION_AUTHORIZATION '[REDACTED]' "$(printf 'Authorization: fixture-hidden\n' | redact)"
+    dev_test_equal REDACTION_AWS_SECRET '[REDACTED]' "$(printf 'AWS_SECRET_ACCESS_KEY=fixture-hidden\n' | redact)"
+    dev_test_equal REDACTION_GITHUB_PAT '[REDACTED]' "$(printf 'ghp_1234567890abcdefghijklmnopqrstuv\n' | redact)" # synthetic fixture token
     dev_test_equal REDACTION_PRIVATE_KEY '[REDACTED PRIVATE KEY]' "$(printf '%s\n' '-----BEGIN PRIVATE KEY-----' 'fixture-hidden' '-----END PRIVATE KEY-----' | redact)"
     dev_test_equal URL_SANITIZE 'https://[REDACTED]@example.invalid/repo' "$(sanitize_url 'https://fixture-hidden@example.invalid/repo?token=fixture-hidden')"
     dev_test_equal GIT_URL_HTTPS 'example.invalid/team/repo' "$(dev_git_url_normalize 'https://fixture-hidden@EXAMPLE.invalid/team/repo.git')"
@@ -3386,6 +3512,7 @@ dev_self_test() {
     if has git; then dev_test_status PUBLICATION_SAFETY_FIXTURES_12 0 developer_publish_self_tests
     else printf '%-40s SKIP (git not installed)\n' PUBLICATION_SAFETY_FIXTURES_12; ((DEV_TEST_SKIPPED+=1)); fi
     dev_test_status UI_AND_PROCESS_CLEANUP_FIXTURES 0 ui_process_self_tests
+    dev_test_status DOCTOR_HYGIENE_FIXTURES 0 doctor_hygiene_self_tests
     printf 'TOTAL CHECKS/GROUPS %d  PASS %d  FAIL %d  SKIP %d\n' "$DEV_TEST_TOTAL" "$DEV_TEST_PASSED" "$DEV_TEST_FAILED" "$DEV_TEST_SKIPPED"
     ((DEV_TEST_FAILED == 0))
 }
@@ -3435,9 +3562,12 @@ dev_validate_body() {
         if git -C "$DEV_REPO" diff --check -- "$DEV_SOURCE_REL" && git -C "$DEV_REPO" diff --cached --check -- "$DEV_SOURCE_REL"; then
             printf '[PASS] Git diff whitespace checks\n'
         else printf '[FAIL] Git diff whitespace checks\n'; failed=1; fi
-        if ! git -C "$DEV_REPO" check-ignore -q -- "$DEV_DIR"; then
-            printf '[WARN] .sentinel-dev is not ignored; it is never staged by this workflow\n'
-        fi
+        local ignore_failed=0 rel
+        for rel in sentinel-output/fixture .sentinel-dev/validation.fixture.log .sentinel-dev/image/fixture .sentinel-dev/fixture.lock .sentinel-dev/fixture.tmp; do
+            git -C "$DEV_REPO" check-ignore -q -- "$rel" || { printf '[FAIL] Runtime artifact is not ignored: %s\n' "$rel"; ignore_failed=1; }
+        done
+        if ((ignore_failed)); then failed=1
+        else printf '[PASS] Runtime/test artifacts are excluded from Git\n'; fi
     else printf '[FAIL] Git readiness\n'; failed=1; fi
     hash_end=$(dev_sha256 "$DEV_SOURCE") || failed=1
     if [[ $hash_start != "$hash_end" ]]; then printf '[FAIL] SOURCE CHANGED DURING VALIDATION\n'; failed=1; fi
