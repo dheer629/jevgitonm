@@ -1,0 +1,150 @@
+# Controlled runtime validation data. Root applies through the dedicated Flux test branch.
+# Expected: Deployment 1/1, pod 2/2, HTTP service one ready backend, PVC Bound.
+# Effective requests: max(100m+50m, init 300m)=300m; max(32Mi+16Mi,64Mi)=64Mi.
+# Effective limits: max(200m+200m,init500m)=500m; max(128Mi+32Mi,128Mi)=160Mi.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: sentinel-bound
+  namespace: sentinel-validation
+  labels: {app.kubernetes.io/part-of: sentinel-validation, sentinel.dev/profile: baseline}
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests: {storage: 64Mi}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sentinel-healthy
+  namespace: sentinel-validation
+  labels: {app.kubernetes.io/part-of: sentinel-validation, sentinel.dev/profile: baseline}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: sentinel-healthy}
+  template:
+    metadata:
+      labels: {app: sentinel-healthy, app.kubernetes.io/part-of: sentinel-validation, sentinel.dev/profile: baseline}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 2
+      initContainers:
+        - name: initialize
+          image: alpine:3.23
+          imagePullPolicy: IfNotPresent
+          command: [/bin/sh, -c, 'printf initialized > /data/fixture-state']
+          resources:
+            requests: {cpu: 300m, memory: 64Mi}
+            limits: {cpu: 500m, memory: 128Mi}
+          volumeMounts: [{name: data, mountPath: /data}]
+      containers:
+        - name: app
+          image: alpine:3.23
+          imagePullPolicy: IfNotPresent
+          command: [/bin/sh, -c]
+          args:
+            - |
+              cat > /tmp/respond.sh <<'RESPONSE'
+              #!/bin/sh
+              while IFS= read -r header; do
+                [ "$header" = "$(printf '\r')" ] && break
+              done
+              printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 15\r\nConnection: close\r\n\r\nsentinel-ready\n'
+              RESPONSE
+              chmod 700 /tmp/respond.sh
+              exec nc -lk -p 8080 -e /tmp/respond.sh
+          ports: [{name: http, containerPort: 8080}]
+          readinessProbe:
+            httpGet: {path: /, port: http}
+            initialDelaySeconds: 1
+            periodSeconds: 3
+          resources:
+            requests: {cpu: 100m, memory: 32Mi}
+            limits: {cpu: 200m, memory: 128Mi}
+          volumeMounts: [{name: data, mountPath: /data}]
+        - name: helper
+          image: alpine:3.23
+          imagePullPolicy: IfNotPresent
+          command: [/bin/sh, -c, 'while :; do sleep 300; done']
+          resources:
+            requests: {cpu: 50m, memory: 16Mi}
+            limits: {cpu: 200m, memory: 32Mi}
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: sentinel-bound}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sentinel-healthy
+  namespace: sentinel-validation
+  labels: {app.kubernetes.io/part-of: sentinel-validation, sentinel.dev/profile: baseline}
+spec:
+  selector: {app: sentinel-healthy}
+  ports: [{name: http, port: 80, targetPort: http}]
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sentinel-readonly
+  namespace: sentinel-validation
+  labels: {app.kubernetes.io/part-of: sentinel-validation, sentinel.dev/profile: baseline}
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sentinel-readonly
+  namespace: sentinel-validation
+  labels: {app.kubernetes.io/part-of: sentinel-validation, sentinel.dev/profile: baseline}
+rules:
+  - apiGroups: ['']
+    resources: [pods, services, endpoints, persistentvolumeclaims, events, configmaps]
+    verbs: [get, list, watch]
+  - apiGroups: ['']
+    resources: [pods/log]
+    verbs: [get]
+  - apiGroups: [apps]
+    resources: [deployments, statefulsets, daemonsets, replicasets]
+    verbs: [get, list, watch]
+  - apiGroups: [batch]
+    resources: [jobs, cronjobs]
+    verbs: [get, list, watch]
+  - apiGroups: [networking.k8s.io]
+    resources: [ingresses]
+    verbs: [get, list, watch]
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [get, list, watch]
+  - apiGroups: [metrics.k8s.io]
+    resources: [pods]
+    verbs: [get, list]
+  - apiGroups: [source.toolkit.fluxcd.io]
+    resources: [gitrepositories, helmrepositories]
+    verbs: [get, list, watch]
+  - apiGroups: [kustomize.toolkit.fluxcd.io]
+    resources: [kustomizations]
+    verbs: [get, list, watch]
+  - apiGroups: [helm.toolkit.fluxcd.io]
+    resources: [helmreleases]
+    verbs: [get, list, watch]
+  - apiGroups: [cert-manager.io]
+    resources: [certificates, certificaterequests, issuers]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sentinel-readonly
+  namespace: sentinel-validation
+  labels: {app.kubernetes.io/part-of: sentinel-validation, sentinel.dev/profile: baseline}
+subjects:
+  - kind: ServiceAccount
+    name: sentinel-readonly
+    namespace: sentinel-validation
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: sentinel-readonly

@@ -10,7 +10,7 @@ umask 077
 
 # 01 Constants and session state
 APP_NAME="KubeOps Sentinel"
-APP_VERSION="1.0.0"
+APP_VERSION="1.0.1"
 APP_BUILD="production"
 SOURCE_FILE="${BASH_SOURCE[0]}"
 SENTINEL_CONTEXT="${SNTL_CONTEXT:-}"
@@ -522,6 +522,16 @@ core_integration_tests() (
     : > "$fixture_dir/calls"
     SENTINEL_CONTEXT=fixture-context SENTINEL_NAMESPACE=fixture-namespace
     INTERACTIVE=0 FORCE_REFRESH=0 CORE_FIXTURE_MODE=healthy
+    # This suite is explicitly offline. bootstrap_scope checks for kubectl before
+    # reaching the mocked run_bounded wrapper, so advertise only the fixture's
+    # mocked kubectl while still requiring the real jq gated above. This keeps
+    # deterministic self-tests runnable on clean CI hosts without Kubernetes.
+    has() {
+        case $1 in
+            kubectl|jq) return 0;;
+            *) command -v "$1" >/dev/null 2>&1;;
+        esac
+    }
     run_bounded() {
         shift
         [[ ${1:-} == command ]] && shift

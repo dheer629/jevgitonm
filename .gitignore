@@ -1,0 +1,14 @@
+# KubeOps Sentinel runtime/session output
+sentinel-output/
+
+# Developer transient data; reusable .sentinel-dev/e2e and fixtures remain tracked
+.sentinel-dev/validation.*.log
+.sentinel-dev/image/
+.sentinel-dev/*.lock
+.sentinel-dev/*.tmp
+
+# Common editor/OS noise
+.DS_Store
+Thumbs.db
+*.swp
+*~

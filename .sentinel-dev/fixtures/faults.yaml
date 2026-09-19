@@ -1,0 +1,93 @@
+# Controlled fault profile; reconcile only after the baseline validation succeeds.
+# Expected --health exit 1, CrashLoopBackOff and image pull failure findings,
+# Pending pod / FailedScheduling and Pending PVC warnings; no baseline changes.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sentinel-crashloop
+  namespace: sentinel-validation
+  labels: {app.kubernetes.io/part-of: sentinel-validation, sentinel.dev/profile: faults}
+spec:
+  automountServiceAccountToken: false
+  terminationGracePeriodSeconds: 1
+  containers:
+    - name: crashing
+      image: alpine:3.23
+      imagePullPolicy: IfNotPresent
+      command: [/bin/sh, -c, 'printf "intentional sentinel crash fixture\n"; exit 23']
+      resources:
+        requests: {cpu: 10m, memory: 8Mi}
+        limits: {cpu: 100m, memory: 32Mi}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sentinel-pending
+  namespace: sentinel-validation
+  labels: {app.kubernetes.io/part-of: sentinel-validation, sentinel.dev/profile: faults}
+spec:
+  automountServiceAccountToken: false
+  terminationGracePeriodSeconds: 1
+  nodeSelector: {sentinel.dev/intentionally-absent-node: 'true'}
+  containers:
+    - name: waiting
+      image: alpine:3.23
+      imagePullPolicy: IfNotPresent
+      command: [/bin/sh, -c, 'sleep 86400']
+      resources:
+        requests: {cpu: 10m, memory: 8Mi}
+        limits: {cpu: 100m, memory: 32Mi}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sentinel-imagepull
+  namespace: sentinel-validation
+  labels: {app.kubernetes.io/part-of: sentinel-validation, sentinel.dev/profile: faults}
+spec:
+  automountServiceAccountToken: false
+  terminationGracePeriodSeconds: 1
+  containers:
+    - name: missing-image
+      image: registry.invalid/sentinel-validation/intentionally-missing:v1
+      imagePullPolicy: Always
+      resources:
+        requests: {cpu: 10m, memory: 8Mi}
+        limits: {cpu: 100m, memory: 32Mi}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: sentinel-failed-job
+  namespace: sentinel-validation
+  labels: {app.kubernetes.io/part-of: sentinel-validation, sentinel.dev/profile: faults}
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels: {app.kubernetes.io/part-of: sentinel-validation, sentinel.dev/profile: faults}
+    spec:
+      automountServiceAccountToken: false
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 1
+      containers:
+        - name: fails-once
+          image: alpine:3.23
+          imagePullPolicy: IfNotPresent
+          command: [/bin/sh, -c, 'printf "intentional sentinel failed Job fixture\n"; exit 7']
+          resources:
+            requests: {cpu: 10m, memory: 8Mi}
+            limits: {cpu: 100m, memory: 32Mi}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: sentinel-pending-pvc
+  namespace: sentinel-validation
+  labels: {app.kubernetes.io/part-of: sentinel-validation, sentinel.dev/profile: faults}
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: ''
+  volumeName: sentinel-validation-intentionally-missing-pv
+  resources:
+    requests: {storage: 32Mi}

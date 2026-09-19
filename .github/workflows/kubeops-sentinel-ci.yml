@@ -1,0 +1,31 @@
+name: KubeOps Sentinel CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deterministic-validation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Preserve executable bit check
+        run: test -x KubeOps_Sentinel.sh
+      - name: Bash syntax
+        run: bash -n KubeOps_Sentinel.sh
+      - name: Deterministic self-tests
+        env:
+          TERM: dumb
+        run: ./KubeOps_Sentinel.sh --dev-self-test --output ./sentinel-output
+      - name: TLS and GitOps loopback E2E
+        env:
+          TERM: dumb
+        run: ./.sentinel-dev/e2e/tls-live-test.sh
+      - name: Repository whitespace check
+        run: git diff --check

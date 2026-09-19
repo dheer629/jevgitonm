@@ -1,0 +1,11 @@
+PASS resource quantity/effective-request invariants
+PASS	POD_READY_ABSENT	INPUT Running pod with no Ready condition	EXPECTED UNKNOWN	ACTUAL UNKNOWN
+PASS	METRIC_COVERAGE	INPUT Running two-container pod; only sidecar has metrics; app status absent	EXPECTED INCOMPLETE	ACTUAL INCOMPLETE
+PASS	DUPLICATE_METRICS	INPUT duplicate metrics container names	EXPECTED PARSE_ERROR	ACTUAL PARSE_ERROR
+PASS	MALFORMED_METRIC	INPUT CPU not-a-quantity	EXPECTED PARSE_ERROR	ACTUAL PARSE_ERROR
+PASS	NEGATIVE_RESOURCE	INPUT CPU -500m	EXPECTED PARSE_ERROR	ACTUAL PARSE_ERROR
+PASS	DUAL_STACK_SERVICE	INPUT one backend pod with IPv4 and IPv6 addresses	EXPECTED 2 addresses;0 missing pods	ACTUAL 2 addresses;0 missing pods
+PASS	NODE_LABELS_ABSENT	INPUT node labels absent	EXPECTED 0	ACTUAL 0
+PASS	NODE_CAPACITY_PARSE	INPUT node CPU capacity broken; memory allocatable absent; Ready absent	EXPECTED PARSE_ERROR;UNAVAILABLE;Ready=UNKNOWN	ACTUAL PARSE_ERROR;UNAVAILABLE;Ready=UNKNOWN
+PASS	DAEMONSET_DESIRED_ABSENT	INPUT DaemonSet status not populated yet	EXPECTED UNKNOWN_DESIRED	ACTUAL UNKNOWN_DESIRED
+PASS all resource report, redaction projection, health, denied, empty, and 501-pod fixtures
