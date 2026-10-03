@@ -3,6 +3,9 @@ set -o pipefail
 ROOT=$(git rev-parse --show-toplevel 2>/dev/null || { cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P; })
 cd -- "$ROOT"
 source ./KubeOps_Sentinel.sh
+for tool in openssl nc jq timeout; do
+    command -v "$tool" >/dev/null 2>&1 || { printf 'Required E2E dependency missing: %s\n' "$tool" >&2; exit 2; }
+done
 umask 077
 mkdir -p -- "$PWD/sentinel-output/validation"
 RUN_DIR=$(mktemp -d "$PWD/sentinel-output/validation/.tls-live.XXXXXXXX") || exit 1
@@ -20,6 +23,9 @@ finish() {
     rm -rf -- "$RUN_DIR"
 }
 trap finish EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 printf '# Actual TLS and GitOps validation\n\nDate: %s\n\nEnvironment: %s; %s. Source: `KubeOps_Sentinel.sh`.\n\n' "$(date -u +%FT%TZ)" "$(uname -sr)" "$(openssl version)" > "$report"
 printf '| Case | Actual input | Expected | Observed | Result |\n|---|---|---|---|---|\n' >> "$report"
 failures=0
@@ -77,6 +83,8 @@ start=$(date +%s)
 tls_report 127.0.0.1 "$port" 2>&1 | redact > sentinel-output/validation/tls-timeout.txt
 rc=${PIPESTATUS[0]}; elapsed=$(( $(date +%s)-start ))
 record 'Server accepts TCP but sends no TLS' "local nc listener; 2-second per-probe limit; wall=${elapsed}s" 3 "$rc"
+result=BOUNDED; ((elapsed<=20)) || result=OVERRUN
+record 'Timeout wall-clock budget' 'maximum 20 seconds for all probes' BOUNDED "$result"
 kill "$stall_pid"; wait "$stall_pid" 2>/dev/null; stall_pid=''
 nc -lk 127.0.0.1 "$port" >/dev/null 2>&1 &
 stall_pid=$!
@@ -85,6 +93,8 @@ start=$(date +%s)
 tls_report 127.0.0.1 "$port" 2>&1 | redact > sentinel-output/validation/tls-timeout-no-timeout-command.txt
 rc=${PIPESTATUS[0]}; elapsed=$(( $(date +%s)-start ))
 record 'Bounded fallback without timeout utility' "local stalled server; timeout hidden; wall=${elapsed}s" 3 "$rc"
+result=BOUNDED; ((elapsed<=20)) || result=OVERRUN
+record 'Fallback wall-clock budget' 'maximum 20 seconds for all probes' BOUNDED "$result"
 has() { command -v "$1" >/dev/null 2>&1; }
 gitops_certificate_self_tests > sentinel-output/validation/gitops-certificate-embedded-fixtures.txt 2>&1
 record 'Embedded GitOps/certificate fixtures' 'projected APIs; exact SHA; generation lag; linked Helm readiness; X.509; scope guards' 0 "$?"

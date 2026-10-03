@@ -1802,9 +1802,9 @@ JSON
 # over the same stubbed-collector pattern used by the resource fixtures.
 triage_integration_tests() (
     has jq || { printf 'SKIP triage fixtures: jq unavailable\n'; exit 0; }
-    local test_root rc errors=0
+    local test_root hygiene_fixture='' rc errors=0
     test_root=$(mktemp -d "$RUN_DIR/triage-fixtures.XXXXXX") || exit 1
-    trap 'rm -rf -- "$test_root"' EXIT
+    trap 'rm -rf -- "$test_root"; [[ -z $hygiene_fixture ]] || rm -f -- "$hygiene_fixture"' EXIT
     RUN_DIR=$test_root CACHE_DIR=$test_root/cache
     mkdir -p -- "$CACHE_DIR" || exit 1
     SENTINEL_NAMESPACE=fixture-ns SENTINEL_CONTEXT=fixture-context
@@ -1909,6 +1909,12 @@ JSON
     grep -q $'pods\tlist\tOK' "$test_root/cap.out" || { printf 'FAIL capabilities rbac matrix\n'; ((errors+=1)); }
     grep -q $'Helm releases\tOK' "$test_root/cap.out" || { printf 'FAIL capabilities helm cache state\n'; ((errors+=1)); }
     # Doctor: healthy environment passes; missing kubectl is an explicit FAIL.
+    # Permission checks need a native Linux fixture, independent of a DrvFS
+    # checkout's synthetic modes and the caller's real kubeconfig.
+    hygiene_fixture=$(mktemp /tmp/kubeops-triage-hygiene.XXXXXXXX) || exit 1
+    printf '%s\n' 'apiVersion: v1' > "$hygiene_fixture" || exit 1
+    chmod 600 "$hygiene_fixture" || exit 1
+    SOURCE_FILE=$hygiene_fixture KUBECONFIG=$hygiene_fixture KUBECONFIG_MODE=EXPLICIT
     doctor_report > "$test_root/doc.out" 2> "$test_root/doc.err"; rc=$?
     [[ $rc == 0 ]] || { printf 'FAIL doctor exit expected 0 observed %s\n' "$rc"; ((errors+=1)); }
     [[ -s $test_root/doc.err ]] && { printf 'FAIL doctor stderr\n'; cat "$test_root/doc.err"; ((errors+=1)); }
@@ -3403,9 +3409,13 @@ dev_cache_fixture() (
 )
 
 doctor_hygiene_self_tests() (
-    local fixture
-    fixture=$(mktemp "$RUN_DIR/doctor-kubeconfig.XXXXXX") || exit 1
-    printf '%s\n' 'apiVersion: v1' > "$fixture"
+    local fixture_dir fixture
+    # DrvFS without metadata does not implement chmod's POSIX mode changes.
+    # Use native temporary storage to exercise real secure/insecure modes.
+    fixture_dir=$(mktemp -d /tmp/kubeops-doctor-hygiene.XXXXXXXX) || exit 1
+    fixture=$fixture_dir/kubeconfig
+    trap 'rm -f -- "$fixture"; rmdir -- "$fixture_dir"' EXIT
+    printf '%s\n' 'apiVersion: v1' > "$fixture" || exit 1
     chmod 600 "$fixture" || exit 1
     SOURCE_FILE=$fixture
     KUBECONFIG_MODE=EXPLICIT
@@ -3416,9 +3426,8 @@ doctor_hygiene_self_tests() (
     doctor_source_hygiene >/dev/null 2>&1 && exit 1
     doctor_kubeconfig_hygiene >/dev/null 2>&1 && exit 1
     chmod 600 "$fixture" || exit 1
-    KUBECONFIG="$fixture:/definitely/missing/kubeconfig"
+    KUBECONFIG="$fixture:$fixture_dir/missing"
     doctor_kubeconfig_hygiene >/dev/null 2>&1 && exit 1
-    rm -f -- "$fixture"
     printf 'PASS source and kubeconfig hygiene permission fixtures\n'
 )
 
@@ -4260,9 +4269,16 @@ declare -a REPORT_HISTORY=()
 capture_report() {
     local title=$1 text rc path
     shift
+    # Failed captures must not leave an older report selected or publish a
+    # partial file as a successful observation.
+    CURRENT_REPORT= CURRENT_TITLE=
     path=$(mktemp "$RUN_DIR/report.XXXXXXXX") || return 2
     text=$("$@" 2>&1); rc=$?
-    { printf '%s | %s\nContext: %s | Namespace: %s\n' "$title" "$(timestamp)" "$SENTINEL_CONTEXT" "$SENTINEL_NAMESPACE"; printf '%s\n' "$text"; } | redact > "$path"
+    if ! { printf '%s | %s\nContext: %s | Namespace: %s\n' "$title" "$(timestamp)" "$SENTINEL_CONTEXT" "$SENTINEL_NAMESPACE"; printf '%s\n' "$text"; } | redact > "$path"; then
+        rm -f -- "$path"
+        printf 'Report capture failed; incomplete output discarded\n' >&2
+        return 2
+    fi
     CURRENT_REPORT=$path CURRENT_TITLE=$title
     REPORT_HISTORY+=("$path")
     if ((${#REPORT_HISTORY[@]}>50)); then
@@ -4299,9 +4315,8 @@ json_report_emit() {
     [[ -f $file ]] || return 2
     [[ $status =~ ^[0-9]+$ ]] || status=0
     if ! has jq; then
-        printf 'UNAVAILABLE: --json requires jq; plain text follows\n' >&2
-        tail -n +3 -- "$file"
-        return 0
+        printf 'UNAVAILABLE: --json requires jq; no plain-text fallback emitted\n' >&2
+        return 2
     fi
     tail -n +3 -- "$file" | redact | jq -Rs \
         --arg application "$APP_NAME" --arg version "$APP_VERSION" --arg title "$title" \
@@ -4827,7 +4842,7 @@ Usage: ./KubeOps_Sentinel.sh [options]
   --no-color --version --help --help-dev
 Environment: SNTL_CONTEXT, SNTL_NAMESPACE, SNTL_REFRESH, SNTL_OUTPUT_DIR,
              SPLUNK_URL, SPLUNK_INDEX, SPLUNK_SOURCETYPE, SPLUNK_TOKEN (never persisted).
-Exit: 0 no operational FAIL; 1 observed operational FAIL; 2 usage/configuration;
+Exit: 0 no operational FAIL; 1 observed operational FAIL; 2 usage/configuration/output error;
       3 authentication/API failure; 4 triage modes only: required data unavailable.
       UNKNOWN is reported, never counted as healthy or zero.
 TXT/CSV exports preserve full report lines. JSON report exports require optional jq.
@@ -4913,6 +4928,13 @@ main() {
     ((rc==10)) && return 0
     ((rc==0)) || return "$rc"
     dependency_detect
+    if ((JSON_FLAG)); then
+        case $MODE in
+            health|resources|gitops|certificates|triage|triage-workload|capabilities|doctor) ;;
+            *) printf '%s\n' '--json requires a report command' >&2; return 2;;
+        esac
+        has jq || { printf 'UNAVAILABLE: --json requires jq\n' >&2; return 2; }
+    fi
     for command_fn in mktemp mkdir rm cat; do has "$command_fn" || { printf 'Required core UNIX utility missing: %s\n' "$command_fn" >&2; return 2; }; done
     color_init; terminal_size
     SOURCE_FILE=$(cd -- "$(dirname -- "$SOURCE_FILE")" && printf '%s/%s' "$(pwd -P)" "${SOURCE_FILE##*/}") || return 2
@@ -4932,14 +4954,14 @@ main() {
     fi
     case $MODE in
         dashboard) dashboard;;
-        resources) capture_report Resources resources_report; rc=$?; cli_report_output Resources "$rc"; return "$rc";;
-        health) capture_report Health health_report; rc=$?; cli_report_output Health "$rc"; return "$rc";;
-        gitops) capture_report GitOps gitops_report; rc=$?; cli_report_output GitOps "$rc"; return "$rc";;
-        certificates) capture_report Certificates certificates_report; rc=$?; cli_report_output Certificates "$rc"; return "$rc";;
-        triage) capture_report Triage triage_report; rc=$?; cli_report_output Triage "$rc"; return "$rc";;
-        triage-workload) capture_report 'Workload triage' triage_workload_report "$TRIAGE_WORKLOAD"; rc=$?; cli_report_output 'Workload triage' "$rc"; return "$rc";;
-        capabilities) capture_report Capabilities capabilities_report; rc=$?; cli_report_output Capabilities "$rc"; return "$rc";;
-        doctor) capture_report Doctor doctor_report; rc=$?; cli_report_output Doctor "$rc"; return "$rc";;
+        resources) capture_report Resources resources_report; rc=$?; cli_report_output Resources "$rc" || return 2; return "$rc";;
+        health) capture_report Health health_report; rc=$?; cli_report_output Health "$rc" || return 2; return "$rc";;
+        gitops) capture_report GitOps gitops_report; rc=$?; cli_report_output GitOps "$rc" || return 2; return "$rc";;
+        certificates) capture_report Certificates certificates_report; rc=$?; cli_report_output Certificates "$rc" || return 2; return "$rc";;
+        triage) capture_report Triage triage_report; rc=$?; cli_report_output Triage "$rc" || return 2; return "$rc";;
+        triage-workload) capture_report 'Workload triage' triage_workload_report "$TRIAGE_WORKLOAD"; rc=$?; cli_report_output 'Workload triage' "$rc" || return 2; return "$rc";;
+        capabilities) capture_report Capabilities capabilities_report; rc=$?; cli_report_output Capabilities "$rc" || return 2; return "$rc";;
+        doctor) capture_report Doctor doctor_report; rc=$?; cli_report_output Doctor "$rc" || return 2; return "$rc";;
         evidence) evidence_create "$EVIDENCE_ID" 9;;
     esac
 }

@@ -27,6 +27,9 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
+      - name: Install validation dependencies
+        run: sudo apt-get update && sudo apt-get install -y jq openssl netcat-openbsd shellcheck
+
       - name: Executable and syntax gates
         shell: bash
         run: |
@@ -37,18 +40,18 @@ jobs:
           for script in "${scripts[@]}"; do
             test -x "$script"
             bash -n "$script"
+            if LC_ALL=C grep -q $'\r' "$script"; then
+              echo "CRLF detected: $script" >&2
+              exit 1
+            fi
           done
 
-      - name: ShellCheck error gate when available
+      - name: ShellCheck errors
         shell: bash
         run: |
           set -euo pipefail
-          if command -v shellcheck >/dev/null 2>&1; then
-            mapfile -t scripts < <(git ls-files '*.sh')
-            shellcheck --severity=error "${scripts[@]}"
-          else
-            echo 'ShellCheck not preinstalled on this runner; embedded static safety remains mandatory.'
-          fi
+          mapfile -t scripts < <(git ls-files '*.sh')
+          shellcheck --severity=error "${scripts[@]}"
 
       - name: Repository safety policy
         shell: bash
@@ -67,6 +70,9 @@ jobs:
             exit 1
           fi
 
+      - name: Output contract regression tests
+        run: bash .sentinel-dev/e2e/output-contract-test.sh
+
       - name: Full developer validation gate
         shell: bash
         run: |
@@ -78,7 +84,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ./.sentinel-dev/e2e/tls-live-test.sh
+          timeout --kill-after=5s 120s bash .sentinel-dev/e2e/tls-live-test.sh
+          test "$(tail -n 1 sentinel-output/validation/tls-gitops-e2e.md)" = 'Aggregate failures: 0'
 
       - name: Repository whitespace check
         shell: bash

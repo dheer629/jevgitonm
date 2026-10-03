@@ -6,6 +6,10 @@ cd -- "$ROOT"
 SOURCE=KubeOps_Sentinel.sh
 OUT_DIR=sentinel-output/validation
 MESSAGE=${SNTL_COMMIT_MESSAGE:-"chore: validate KubeOps Sentinel source"}
+# Never include pre-existing unrelated staged work in this helper's commit.
+while IFS= read -r -d '' path; do
+    [[ $path == "$SOURCE" ]] || { printf 'Refusing unrelated staged path: %s\n' "$path" >&2; exit 2; }
+done < <(git diff --cached --name-only -z)
 mkdir -p -- "$OUT_DIR"
 
 bash -n "$SOURCE"
